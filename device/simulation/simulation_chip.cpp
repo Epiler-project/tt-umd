@@ -32,17 +32,6 @@ std::unique_ptr<SimulationChip> SimulationChip::create(
     return std::make_unique<SimulationChip>(simulator_directory, soc_descriptor, chip_id, std::move(tt_device));
 }
 
-std::string SimulationChip::get_soc_descriptor_path_from_simulator_path(const std::filesystem::path& simulator_path) {
-    return (simulator_path.extension() == ".so") ? (simulator_path.parent_path() / "soc_descriptor.yaml")
-                                                 : (simulator_path / "soc_descriptor.yaml");
-}
-
-std::string SimulationChip::get_cluster_descriptor_path_from_simulator_path(
-    const std::filesystem::path& simulator_path) {
-    return (simulator_path.extension() == ".so") ? (simulator_path.parent_path() / "cluster_descriptor.yaml")
-                                                 : (simulator_path / "cluster_descriptor.yaml");
-}
-
 SimulationChip::SimulationChip(
     const std::filesystem::path& simulator_directory,
     const SocDescriptor& soc_descriptor,

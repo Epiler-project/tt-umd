@@ -22,6 +22,10 @@ install(
     COMPONENT umd-dev
 )
 
+if(NOT PROJECT_IS_TOP_LEVEL)
+    return()
+endif()
+
 set(CPACK_GENERATOR "DEB;RPM")
 set(CPACK_PACKAGE_VENDOR "Tenstorrent, Inc.")
 set(CPACK_PACKAGE_NAME "tt_umd")

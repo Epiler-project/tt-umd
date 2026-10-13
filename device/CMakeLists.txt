@@ -47,9 +47,9 @@ set_target_properties(
     tt-umd
     PROPERTIES
         VERSION
-            ${CMAKE_PROJECT_VERSION}
+            ${umd_VERSION}
         SOVERSION
-            ${CMAKE_PROJECT_VERSION_MAJOR}
+            ${umd_VERSION_MAJOR}
 )
 
 # Enable unity builds for faster compilation 
@@ -148,6 +148,7 @@ target_sources(
         # (TT_UMD_BUILD_SIMULATION=OFF).
         simulation/simulation_server_socket.cpp
         simulation/simulation_client.cpp
+        simulation/simulation_paths.cpp
         # Length-prefixed message framing over the socket (uses asio, a core dependency; no
         # FlatBuffers), so it is always built and unit-tested in the same no-card baremetal lane.
         simulation/simulation_server_transport.cpp

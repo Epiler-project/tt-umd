@@ -175,26 +175,28 @@ CPMAddPackage(
 ####################################################################################################################
 # nanobind
 ####################################################################################################################
-if(CPM_LOCAL_PACKAGES_ONLY)
-    # When using only local packages, CPM uses "find_package".
-    # nanobind wants python included before CPM calls "find_package".
-    find_package(
-        Python
-        COMPONENTS
-            Interpreter
-            Development
-        REQUIRED
+if(TT_UMD_BUILD_PYTHON)
+    if(CPM_LOCAL_PACKAGES_ONLY)
+        # When using only local packages, CPM uses "find_package".
+        # nanobind wants python included before CPM calls "find_package".
+        find_package(
+            Python
+            COMPONENTS
+                Interpreter
+                Development
+            REQUIRED
+        )
+    endif()
+
+    CPMAddPackage(
+        NAME nanobind
+        GITHUB_REPOSITORY wjakob/nanobind
+        VERSION 2.10.2
+        SYSTEM YES
+        OPTIONS
+            "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
     )
 endif()
-
-CPMAddPackage(
-    NAME nanobind
-    GITHUB_REPOSITORY wjakob/nanobind
-    VERSION 2.10.2
-    SYSTEM YES
-    OPTIONS
-        "CMAKE_MESSAGE_LOG_LEVEL NOTICE"
-)
 
 ####################################################################################################################
 # asio (Standalone)

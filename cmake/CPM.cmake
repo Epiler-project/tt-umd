@@ -6,18 +6,27 @@ set(CPM_DOWNLOAD_VERSION 0.40.2)
 set(CPM_HASH_SUM "c8cdc32c03816538ce22781ed72964dc864b2a34a310d3b7104812a5ca2d835d")
 
 # Always Require the CMake option, but provide default
-set(CPM_SOURCE_CACHE "${CMAKE_SOURCE_DIR}/.cpmcache" CACHE STRING "Path to CPM source cache")
+set(CPM_SOURCE_CACHE "${PROJECT_BINARY_DIR}/_deps/cache" CACHE STRING "Path to CPM source cache")
 
 set(CPM_DOWNLOAD_LOCATION "${CPM_SOURCE_CACHE}/cpm/CPM_${CPM_DOWNLOAD_VERSION}.cmake")
 
 # Expand relative path. This is important if the provided path contains a tilde (~)
 get_filename_component(CPM_DOWNLOAD_LOCATION ${CPM_DOWNLOAD_LOCATION} ABSOLUTE)
 
-file(
-    DOWNLOAD
+# Reuse only the pinned loader; an offline configure with a populated cache
+# must not contact the network merely to download the identical CMake file.
+set(_cpm_loader_hash "")
+if(EXISTS "${CPM_DOWNLOAD_LOCATION}")
+    file(SHA256 "${CPM_DOWNLOAD_LOCATION}" _cpm_loader_hash)
+endif()
+if(NOT _cpm_loader_hash STREQUAL CPM_HASH_SUM)
+    file(DOWNLOAD
         https://github.com/cpm-cmake/CPM.cmake/releases/download/v${CPM_DOWNLOAD_VERSION}/CPM.cmake
-        ${CPM_DOWNLOAD_LOCATION}
-    EXPECTED_HASH SHA256=${CPM_HASH_SUM}
-)
+        "${CPM_DOWNLOAD_LOCATION}"
+        EXPECTED_HASH SHA256=${CPM_HASH_SUM}
+        TLS_VERIFY ON
+    )
+endif()
+unset(_cpm_loader_hash)
 
 include(${CPM_DOWNLOAD_LOCATION})
