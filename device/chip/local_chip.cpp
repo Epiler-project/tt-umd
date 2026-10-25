@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -64,13 +65,13 @@ std::unique_ptr<LocalChip> LocalChip::create(std::unique_ptr<TTDevice> tt_device
 }
 
 LocalChip::LocalChip(
-    std::unique_ptr<TTDevice> tt_device,
-    std::unique_ptr<TLBManager> tlb_manager,
-    std::unique_ptr<SysmemManager> sysmem_manager) :
+    std::unique_ptr<TTDevice>&& tt_device,
+    std::unique_ptr<TLBManager>&& tlb_manager,
+    std::unique_ptr<SysmemManager>&& sysmem_manager) :
     Chip(tt_device->get_chip_info(), tt_device->get_arch()),
+    tt_device_(std::move(tt_device)),
     tlb_manager_(std::move(tlb_manager)),
-    sysmem_manager_(std::move(sysmem_manager)),
-    tt_device_(std::move(tt_device)) {
+    sysmem_manager_(std::move(sysmem_manager)) {
     tt_device_->set_power_state(TTDevice::PowerState::BUSY);
     wait_chip_to_be_ready();
     if (tlb_manager_ != nullptr) {
@@ -79,9 +80,21 @@ LocalChip::LocalChip(
 }
 
 LocalChip::~LocalChip() {
-    // Deconstruct the LocalChip in the right order.
-    // TODO: Use intializers in constructor to avoid having to explicitly declare the order of destruction.
-    tt_device_->set_power_state(TTDevice::PowerState::IDLE);
+    // Release active device state while its owner and all borrowers are live.
+    // A quarantined connection cannot issue ordinary power I/O. Closing that
+    // original connection releases its per-client power requirement instead.
+    auto *const pci_device = tt_device_->get_pci_device();
+    if (pci_device == nullptr || pci_device->get_connection().is_valid()) {
+        try {
+            tt_device_->set_power_state(TTDevice::PowerState::IDLE);
+        } catch (const error::UmdException<error::PciDeviceConnectionError> &failure) {
+            // Quarantine may race the validity check. Only that same retained
+            // connection's typed failure permits cleanup to continue.
+            if (pci_device == nullptr || pci_device->get_connection().is_valid() ||
+                failure.error().data().device_num != pci_device->get_device_num())
+                std::terminate();
+        }
+    }
     cached_wc_tlb_window.reset();
     cached_uc_tlb_window.reset();
     sysmem_manager_.reset();
@@ -104,10 +117,13 @@ void LocalChip::initialize_default_chip_mutexes() {
     }
 
     // Initialize interprocess mutexes to make host -> device memory barriers atomic.
-    LockManager::initialize_mutex(MutexType::MEM_BARRIER, device_id, device_type);
+    if (device_type != IODeviceType::PCIe)
+        LockManager::initialize_mutex(MutexType::MEM_BARRIER, device_id, device_type);
 
-    // Initialize mutex guarding initialized chips.
-    LockManager::initialize_mutex(MutexType::CHIP_IN_USE, device_id, device_type);
+    // PCIe CHIP_IN_USE is acquired from the actual retained connection at startup;
+    // only non-PCIe routes use the numeric robust-only initialization.
+    if (device_type != IODeviceType::PCIe)
+        LockManager::initialize_mutex(MutexType::CHIP_IN_USE, device_id, device_type);
 }
 
 void LocalChip::initialize_membars(uint32_t dram_subchannel) {
@@ -146,10 +162,15 @@ void LocalChip::start_device(uint32_t dram_membar_subchannel) {
 
     // TODO: acquire mutex should live in Chip class. Currently we don't have unique id for all chips.
     // The lock here should suffice since we have to open Local chip to have Remote chips initialized.
-    chip_started_lock_.emplace(LockManager::acquire_mutex(
-        MutexType::CHIP_IN_USE,
-        tt_device_->get_communication_device_id(),
-        tt_device_->get_communication_device_type()));
+    if (tt_device_->get_communication_device_type() == IODeviceType::PCIe) {
+        chip_started_pcie_lock_.emplace(LockManager::acquire_pcie_resource(
+            tt_device_->get_pci_device()->get_connection(), PcieResourceLockKind::ChipInUse));
+    } else {
+        chip_started_robust_lock_.emplace(LockManager::acquire_mutex(
+            MutexType::CHIP_IN_USE,
+            tt_device_->get_communication_device_id(),
+            tt_device_->get_communication_device_type()));
+    }
 
     sysmem_manager_->pin_or_map_sysmem_to_device();
     initialize_membars(dram_membar_subchannel);
@@ -170,7 +191,14 @@ void LocalChip::close_device() {
             tlb_manager_->clear_mapped_tlbs();
         }
     }
-    chip_started_lock_.reset();
+    if (chip_started_pcie_lock_) {
+        chip_started_pcie_lock_->unlock();
+        chip_started_pcie_lock_.reset();
+    }
+    if (chip_started_robust_lock_) {
+        chip_started_robust_lock_->unlock();
+        chip_started_robust_lock_.reset();
+    }
 };
 
 int LocalChip::get_num_host_channels() {
@@ -437,6 +465,14 @@ void LocalChip::set_membar_flag(
 
 void LocalChip::insert_host_to_device_barrier(const std::vector<CoreCoord>& cores, const uint32_t barrier_addr) {
     // Ensure that this memory barrier is atomic across processes/threads.
+    if (tt_device_->get_communication_device_type() == IODeviceType::PCIe) {
+        auto lock = LockManager::acquire_pcie_resource(
+            tt_device_->get_pci_device()->get_connection(), PcieResourceLockKind::MemoryBarrier);
+        set_membar_flag(cores, MemBarFlag::SET, barrier_addr);
+        set_membar_flag(cores, MemBarFlag::RESET, barrier_addr);
+        lock.unlock();
+        return;
+    }
     auto lock = LockManager::acquire_mutex(
         MutexType::MEM_BARRIER, tt_device_->get_communication_device_id(), tt_device_->get_communication_device_type());
     set_membar_flag(cores, MemBarFlag::SET, barrier_addr);

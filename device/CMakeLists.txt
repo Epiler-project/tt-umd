@@ -93,6 +93,7 @@ target_sources(
         hugepage.cpp
         logging/config.cpp
         pcie/pci_device.cpp
+        pcie/pci_device_reset.cpp
         types/tlb.cpp
         cluster_descriptor.cpp
         tt_device/blackhole_tt_device.cpp

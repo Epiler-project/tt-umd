@@ -77,16 +77,21 @@ public:
 
 private:
     LocalChip(
-        std::unique_ptr<TTDevice> tt_device,
-        std::unique_ptr<TLBManager> tlb_manager,
-        std::unique_ptr<SysmemManager> sysmem_manager);
+        std::unique_ptr<TTDevice>&& tt_device,
+        std::unique_ptr<TLBManager>&& tlb_manager,
+        std::unique_ptr<SysmemManager>&& sysmem_manager);
 
+    // Declared before every borrower so constructor unwinding also releases
+    // their resources before the device, without relying on ~LocalChip().
+    std::unique_ptr<TTDevice> tt_device_ = nullptr;
     std::unique_ptr<TLBManager> tlb_manager_;
     std::unique_ptr<SysmemManager> sysmem_manager_;
 
-    // unique_lock is RAII, so if this member holds an object, the mutex is locked, if it is empty, the
-    // mutex is unlocked.
-    std::optional<std::unique_lock<MutexInterface>> chip_started_lock_;
+    // PCIe startup retains the original connection through the typed resource guard. Other
+    // non-PCIe routes keep their robust-only startup lock, while PCIe and JTAG routing remain
+    // explicit rather than being inferred from a numeric device id.
+    std::optional<PcieResourceLock> chip_started_pcie_lock_;
+    std::optional<std::unique_lock<MutexInterface>> chip_started_robust_lock_;
 
     void initialize_tlb_manager();
     void initialize_default_chip_mutexes();
@@ -95,8 +100,6 @@ private:
     void set_membar_flag(
         const std::vector<CoreCoord>& cores, const uint32_t barrier_value, const uint32_t barrier_addr);
     void insert_host_to_device_barrier(const std::vector<CoreCoord>& cores, const uint32_t barrier_addr);
-
-    std::unique_ptr<TTDevice> tt_device_ = nullptr;
 
     TlbWindow* get_cached_wc_tlb_window();
     TlbWindow* get_cached_uc_tlb_window();

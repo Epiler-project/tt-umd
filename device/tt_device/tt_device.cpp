@@ -67,11 +67,6 @@ enum class RiscType : std::uint64_t;
 }
 
 TTDevice::TTDevice(std::unique_ptr<TTDeviceModel> model) : model_(std::move(model)) {
-    if (model_->get_pcie_interface() != nullptr) {
-        // Initialize PCIe DMA mutex through LockManager for cross-process synchronization.
-        LockManager::initialize_mutex(
-            MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
-    }
     wire_hang_detector();
 }
 
@@ -124,8 +119,15 @@ void TTDevice::init_tt_device(const std::chrono::milliseconds timeout_ms) {
         }
     }
 
-    auto pci_device = std::make_unique<PCIDevice>(device_number);
-    arch = pci_device->get_arch();
+    return create(std::make_unique<PCIDevice>(device_number), use_safe_api, soc_arch_descriptor);
+}
+
+std::unique_ptr<TTDevice> TTDevice::create(
+    std::unique_ptr<PCIDevice> pci_device,
+    bool use_safe_api,
+    const std::shared_ptr<SocArchDescriptor> &soc_arch_descriptor) {
+    UMD_ASSERT(pci_device != nullptr, error::RuntimeError, "Cannot create TTDevice without a retained PCIDevice.");
+    const tt::ARCH arch = pci_device->get_arch();
 
     switch (arch) {
         case ARCH::WORMHOLE_B0:
@@ -672,12 +674,14 @@ void TTDevice::dma_write(const void *src, uint64_t dst_addr, size_t size, CoreCo
     if (is_remote()) {
         UMD_THROW(error::RuntimeError, "DMA write not supported for remote device.");
     }
-    auto pcie_dma_lock =
-        LockManager::acquire_mutex(MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
+    UMD_ASSERT(get_pci_device() != nullptr, error::RuntimeError, "DMA requires a retained PCIe device connection.");
+    auto pcie_dma_lock = LockManager::acquire_pcie_resource(
+        get_pci_device()->get_connection(), PcieResourceLockKind::Dma);
 
     // Returns true if DMA transfer succeeded, false if DMA is not available.
     bool dma_success = get_dma_interface()->dma_write(src, dst_addr, size, resolve_coordinate(core, noc_id), noc_id);
     if (dma_success) {
+        pcie_dma_lock.unlock();
         return;
     }
 
@@ -691,12 +695,14 @@ void TTDevice::dma_read(void *dst, uint64_t src_addr, size_t size, CoreCoord cor
     if (is_remote()) {
         UMD_THROW(error::RuntimeError, "DMA read from device not supported for remote device.");
     }
-    auto pcie_dma_lock =
-        LockManager::acquire_mutex(MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
+    UMD_ASSERT(get_pci_device() != nullptr, error::RuntimeError, "DMA requires a retained PCIe device connection.");
+    auto pcie_dma_lock = LockManager::acquire_pcie_resource(
+        get_pci_device()->get_connection(), PcieResourceLockKind::Dma);
 
     // Returns true if DMA transfer succeeded, false if DMA is not available.
     bool dma_success = get_dma_interface()->dma_read(dst, src_addr, size, resolve_coordinate(core, noc_id), noc_id);
     if (dma_success) {
+        pcie_dma_lock.unlock();
         return;
     }
 
@@ -711,14 +717,16 @@ void TTDevice::dma_write_to_core_range(
     if (is_remote()) {
         UMD_THROW(error::RuntimeError, "DMA write to core range not supported for remote device.");
     }
-    auto pcie_dma_lock =
-        LockManager::acquire_mutex(MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
+    UMD_ASSERT(get_pci_device() != nullptr, error::RuntimeError, "DMA requires a retained PCIe device connection.");
+    auto pcie_dma_lock = LockManager::acquire_pcie_resource(
+        get_pci_device()->get_connection(), PcieResourceLockKind::Dma);
 
     // Returns true if DMA transfer succeeded, false if DMA is not available.
     bool dma_success = get_dma_interface()->dma_multicast_write(
         src, dst_addr, size, resolve_coordinate(core_start, noc_id), resolve_coordinate(core_end, noc_id), noc_id);
 
     if (dma_success) {
+        pcie_dma_lock.unlock();
         return;
     }
 
@@ -732,11 +740,13 @@ void TTDevice::dma_read_zero_copy(uint64_t dst_iova, uint64_t src_addr, size_t s
     if (is_remote()) {
         UMD_THROW(error::RuntimeError, "DMA zero-copy read not supported for remote device.");
     }
-    auto pcie_dma_lock =
-        LockManager::acquire_mutex(MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
+    UMD_ASSERT(get_pci_device() != nullptr, error::RuntimeError, "DMA requires a retained PCIe device connection.");
+    auto pcie_dma_lock = LockManager::acquire_pcie_resource(
+        get_pci_device()->get_connection(), PcieResourceLockKind::Dma);
 
     bool dma_success =
         get_dma_interface()->dma_read_zero_copy(dst_iova, src_addr, size, resolve_coordinate(core, noc_id), noc_id);
+    pcie_dma_lock.unlock();
     if (!dma_success) {
         UMD_THROW(error::RuntimeError, "DMA zero-copy read failed: no DMA buffer allocated for this device.");
     }
@@ -747,11 +757,13 @@ void TTDevice::dma_write_zero_copy(uint64_t src_iova, uint64_t dst_addr, size_t 
     if (is_remote()) {
         UMD_THROW(error::RuntimeError, "DMA zero-copy write not supported for remote device.");
     }
-    auto pcie_dma_lock =
-        LockManager::acquire_mutex(MutexType::PCIE_DMA, get_communication_device_id(), get_communication_device_type());
+    UMD_ASSERT(get_pci_device() != nullptr, error::RuntimeError, "DMA requires a retained PCIe device connection.");
+    auto pcie_dma_lock = LockManager::acquire_pcie_resource(
+        get_pci_device()->get_connection(), PcieResourceLockKind::Dma);
 
     bool dma_success =
         get_dma_interface()->dma_write_zero_copy(src_iova, dst_addr, size, resolve_coordinate(core, noc_id), noc_id);
+    pcie_dma_lock.unlock();
     if (!dma_success) {
         UMD_THROW(error::RuntimeError, "DMA zero-copy write failed: no DMA buffer allocated for this device.");
     }

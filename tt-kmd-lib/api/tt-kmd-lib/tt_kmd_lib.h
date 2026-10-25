@@ -144,7 +144,11 @@ int tt_device_open(const char* chardev_path, tt_device_t** out_dev, int extra_fl
 /**
  * @brief Close a Tenstorrent device.
  *
+ * Always consumes the handle, including when Linux close(2) reports an error.
+ * The caller must not reuse the handle or retry closing it.
+ *
  * @param dev Device handle
+ * @return 0 on success, negative errno from close(2) on failure
  */
 int tt_device_close(tt_device_t* dev);
 
@@ -235,6 +239,21 @@ typedef struct tt_bar_mappings_t {
  * @return 0 on success, error code on failure
  */
 int tt_device_query_bar_mappings(tt_device_t* dev, tt_bar_mappings_t* out_mappings);
+
+/**
+ * @brief Map a BAR view through the retained device connection.
+ *
+ * The caller supplies an mmap offset obtained from the device's BAR mapping
+ * query and owns the returned read/write shared mapping. Unmap it before
+ * closing the device. No raw descriptor is exposed or reopened.
+ *
+ * @param dev Retained device handle
+ * @param offset Device mmap offset, representable by off_t
+ * @param size Nonzero mapping size in bytes
+ * @param out_mapping Set to NULL on failure, mapped address on success
+ * @return 0 on success, negative errno on failure
+ */
+int tt_device_map_bar(tt_device_t* dev, uint64_t offset, size_t size, void** out_mapping);
 
 /**
  * @brief Convenience function to read a 32-bit value from a device NOC address.
@@ -612,11 +631,17 @@ enum tt_power_flags {
 int tt_device_set_power_state(tt_device_t* dev, uint16_t power_flags);
 
 /**
- * @brief Reset the given device. The device handle will be invalidated after a successful reset.
+ * @brief Issue a reset command without consuming the device handle.
+ *
+ * The caller retains ownership on every return path and must eventually call
+ * tt_device_close(). A successful result reports the existing reset ioctl's
+ * outcome only; a reset may invalidate the handle for subsequent driver I/O.
  *
  * @param dev Device handle; must not be NULL
  * @param reset_flags Reset flags.
- * @return 0 on success, negative error code on failure
+ * @return 0 on a complete successful response; -EPROTO for a short response,
+ *         -EIO for a reported reset failure, -ENODEV for NULL dev, or the
+ *         negative syscall errno. No return path closes or frees dev.
  */
 int tt_device_reset(tt_device_t* dev, uint32_t reset_flags);
 

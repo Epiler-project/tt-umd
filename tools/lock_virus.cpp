@@ -36,6 +36,19 @@ namespace {
 constexpr std::string_view DEVICE_TYPE_PCIE = "pcie";
 constexpr std::string_view DEVICE_TYPE_JTAG = "jtag";
 
+std::optional<PcieResourceLockKind> pcie_resource_kind(MutexType type) {
+    switch (type) {
+    case MutexType::PCIE_DMA:
+        return PcieResourceLockKind::Dma;
+    case MutexType::MEM_BARRIER:
+        return PcieResourceLockKind::MemoryBarrier;
+    case MutexType::CHIP_IN_USE:
+        return PcieResourceLockKind::ChipInUse;
+    default:
+        return std::nullopt;
+    }
+}
+
 }  // namespace
 
 // ── reporting ─────────────────────────────────────────────────────────────────
@@ -54,7 +67,15 @@ static void report_state(const std::string& mutex_name, const std::optional<std:
 }
 
 static void report_device_locks(int device_id, IODeviceType device_type) {
+    std::unique_ptr<PciDeviceConnection> resource_connection;
+    if (device_type == IODeviceType::PCIe)
+        resource_connection = std::make_unique<PciDeviceConnection>(device_id, PciDeviceConnectionMode::LockOnly);
     for (MutexType mutex_type : LockManager::CHIP_SPECIFIC_MUTEX_TYPES) {
+        const auto resource_kind = pcie_resource_kind(mutex_type);
+        if (resource_kind && resource_connection != nullptr) {
+            report_state(to_string(mutex_type), LockManager::probe_pcie_resource(*resource_connection, *resource_kind));
+            continue;
+        }
         LockManager::initialize_mutex(mutex_type, device_id, device_type);
         report_state(to_string(mutex_type), LockManager::probe_mutex(mutex_type, device_id, device_type));
     }
@@ -111,6 +132,13 @@ static void spin_forever() {
 
 static void hold_lock(MutexType mutex_type, std::optional<int> device_id, IODeviceType device_type) {
     if (device_id.has_value()) {
+        const auto resource_kind = pcie_resource_kind(mutex_type);
+        if (resource_kind && device_type == IODeviceType::PCIe) {
+            PciDeviceConnection connection(*device_id, PciDeviceConnectionMode::LockOnly);
+            auto lock = LockManager::acquire_pcie_resource(connection, *resource_kind);
+            log_info(tt::LogUMD, "Holding lock — press Ctrl-C to release.");
+            spin_forever();
+        }
         LockManager::initialize_mutex(mutex_type, *device_id, device_type);
         auto lock = LockManager::acquire_mutex(mutex_type, *device_id, device_type);
         log_info(tt::LogUMD, "Holding lock — press Ctrl-C to release.");

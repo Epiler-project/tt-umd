@@ -50,6 +50,8 @@ add_custom_target(
         unit_tests_wormhole
         unit_tests_glx
         test_pcie_device
+        test_kmd_reset
+        test_pci_device_connection
         api_tests
         hang_detection_tests
         baremetal_tests

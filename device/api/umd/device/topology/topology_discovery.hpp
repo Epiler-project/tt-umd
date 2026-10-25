@@ -169,6 +169,10 @@ protected:
     std::optional<FirmwareBundleVersion> first_fw_bundle_version;
 
 private:
+    // Metadata selection precedes ordinary connection acquisition. These real
+    // owners are moved once into TTDevice; discovery never reopens their IDs.
+    std::vector<std::unique_ptr<PCIDevice>> pci_devices_;
+
     // Initializes the device. On success returns true. On a recoverable initialization failure, logs
     // the error, records the structured error in health_errors keyed by the device's mocked (unhealthy)
     // ASIC ID, and returns false. Rethrows when device_init_failure_action is THROW.

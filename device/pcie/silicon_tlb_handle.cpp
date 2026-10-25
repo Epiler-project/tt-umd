@@ -60,7 +60,12 @@ void SiliconTlbHandle::configure(const tlb_data& new_config) {
 
 void SiliconTlbHandle::free_tlb() noexcept {
     TracyFreeN(tlb_base_, "TLB");
-    tt_tlb_free(pci_device_.get_tt_device_handle(), tlb_handle_);
+    tt_tlb_free(pci_device_.get_cleanup_handle(), tlb_handle_);
+}
+
+uint8_t* SiliconTlbHandle::get_base() const {
+    pci_device_.get_tt_device_handle();
+    return tlb_base_;
 }
 
 tt::ARCH SiliconTlbHandle::get_arch() const { return pci_device_.get_arch(); }

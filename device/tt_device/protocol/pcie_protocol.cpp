@@ -71,6 +71,7 @@ void PcieProtocol::set_io_timeout_callback(const std::function<bool(NocId)>& han
 }
 
 TlbWindow* PcieProtocol::get_cached_tlb_window() {
+    pci_device_->get_tt_device_handle();
     if (cached_tlb_window_ == nullptr) {
         cached_tlb_window_ = std::make_unique<SiliconTlbWindow>(
             pci_device_->allocate_tlb(
@@ -131,7 +132,7 @@ void PcieProtocol::bar_write32(uint32_t addr, uint32_t data) {
         UMD_THROW(error::RuntimeError, "Write Invalid BAR address for this device.");
     }
     addr -= BAR0_OFFSET;
-    *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(pci_device_->bar0) + addr) = data;
+    *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(pci_device_->get_bar0()) + addr) = data;
 }
 
 uint32_t PcieProtocol::bar_read32(uint32_t addr) {
@@ -139,7 +140,7 @@ uint32_t PcieProtocol::bar_read32(uint32_t addr) {
         UMD_THROW(error::RuntimeError, "Read Invalid BAR address for this device.");
     }
     addr -= BAR0_OFFSET;
-    return *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(pci_device_->bar0) + addr);
+    return *reinterpret_cast<volatile uint32_t*>(static_cast<uint8_t*>(pci_device_->get_bar0()) + addr);
 }
 
 PCIDevice* PcieProtocol::get_pci_device() { return pci_device_.get(); }
@@ -400,7 +401,7 @@ TlbWindow* PcieProtocol::get_cached_dma_tlb_window(tlb_data config) {
 
 void PcieProtocol::dma_d2h_transfer(const uint64_t dst, const uint32_t src, const size_t size) {
     DmaBuffer& dma_buffer = pci_device_->get_dma_buffer();
-    volatile uint8_t* bar2 = reinterpret_cast<volatile uint8_t*>(pci_device_->bar2_uc);
+    volatile uint8_t* bar2 = reinterpret_cast<volatile uint8_t*>(pci_device_->get_bar2_uc());
 
     if (!dma_buffer.completion || !dma_buffer.buffer) {
         UMD_THROW(error::RuntimeError, "DMA buffer is not initialized.");
@@ -423,7 +424,7 @@ void PcieProtocol::dma_d2h_transfer(const uint64_t dst, const uint32_t src, cons
 
 void PcieProtocol::dma_h2d_transfer(const uint32_t dst, const uint64_t src, const size_t size) {
     DmaBuffer& dma_buffer = pci_device_->get_dma_buffer();
-    volatile uint8_t* bar2 = reinterpret_cast<volatile uint8_t*>(pci_device_->bar2_uc);
+    volatile uint8_t* bar2 = reinterpret_cast<volatile uint8_t*>(pci_device_->get_bar2_uc());
 
     if (!dma_buffer.completion || !dma_buffer.buffer) {
         UMD_THROW(error::RuntimeError, "DMA buffer is not initialized.");

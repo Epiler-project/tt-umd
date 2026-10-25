@@ -5,11 +5,16 @@
 #include "umd/device/utils/lock_manager.hpp"
 
 #include <memory>
+#include <cerrno>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <tt-logger/tt-logger.hpp>
 #include <unordered_map>
+#include <thread>
 
+#include "pcie/pci_device_connection_state.hpp"
+#include "tt-kmd-lib/tt_kmd_lib.h"
 #include "umd/device/utils/error.hpp"
 #include "umd/device/utils/kmd_mutex.hpp"
 #include "umd/device/utils/robust_mutex.hpp"
@@ -41,9 +46,7 @@ const std::unordered_map<MutexType, uint8_t> MUTEX_TYPE_TO_KMD_LOCK_INDEX = {
     {MutexType::ARC_MSG, 16},
     {MutexType::REMOTE_ARC_MSG, 17},
     {MutexType::NON_MMIO, 18},
-    {MutexType::MEM_BARRIER, 19},
     {MutexType::CHIP_IN_USE, 20},
-    {MutexType::PCIE_DMA, 21},
 };
 
 uint8_t get_kmd_lock_index(MutexType mutex_type) {
@@ -180,7 +183,138 @@ MutexInterface& get_initialized_mutex(const std::string& mutex_name) {
     return *it->second;
 }
 
+void reject_numeric_pcie_resource(MutexType mutex_type, IODeviceType device_type) {
+    UMD_ASSERT(
+        device_type != IODeviceType::PCIe ||
+            (mutex_type != MutexType::PCIE_DMA && mutex_type != MutexType::MEM_BARRIER &&
+             mutex_type != MutexType::CHIP_IN_USE),
+        error::RuntimeError,
+        "PCIe resource locks require their retained PciDeviceConnection owner.");
+}
+
+struct PcieResourceLockDescriptor {
+    MutexType mutex_type;
+    uint8_t index;
+};
+
+PcieResourceLockDescriptor resource_lock_descriptor(PcieResourceLockKind kind) {
+    switch (kind) {
+    case PcieResourceLockKind::Dma:
+        return {MutexType::PCIE_DMA, 21};
+    case PcieResourceLockKind::MemoryBarrier:
+        return {MutexType::MEM_BARRIER, 19};
+    case PcieResourceLockKind::ChipInUse:
+        return {MutexType::CHIP_IN_USE, 20};
+    }
+    UMD_THROW(error::RuntimeError, "Unknown PCIe resource lock kind.");
+}
+
 }  // namespace
+
+PcieResourceLock::PcieResourceLock(
+    std::shared_ptr<PciDeviceConnectionState> connection, MutexInterface &robust, uint8_t index) :
+    connection_(std::move(connection)), robust_(&robust), index_(index) {}
+
+PcieResourceLock::PcieResourceLock(PcieResourceLock &&other) noexcept :
+    connection_(std::move(other.connection_)),
+    robust_(std::exchange(other.robust_, nullptr)),
+    index_(other.index_),
+    robust_held_(std::exchange(other.robust_held_, false)),
+    kmd_held_(std::exchange(other.kmd_held_, false)) {}
+
+PcieResourceLock::~PcieResourceLock() noexcept {
+    try {
+        release();
+    } catch (...) {
+        // release() already quarantined the original state. Preserve any
+        // exception currently unwinding; the final state owner closes once.
+    }
+}
+
+void PcieResourceLock::release() {
+    int result = 0;
+    if (std::exchange(kmd_held_, false)) {
+        int was_held = 0;
+        result = tt_lock_release(connection_->handle, index_, &was_held);
+        if (result == 0 && was_held != 1)
+            result = -EIO;
+        if (result != 0)
+            connection_->quarantine(PciDeviceConnectionStatus::LockReleaseFailed, -result);
+    }
+    if (std::exchange(robust_held_, false)) {
+        try {
+            robust_->unlock();
+        } catch (...) {
+            connection_->quarantine(PciDeviceConnectionStatus::LockReleaseFailed, EIO);
+            connection_->require_valid();
+        }
+    }
+    if (result != 0)
+        connection_->require_valid();
+}
+
+void PcieResourceLock::unlock() { release(); }
+
+PcieResourceLock LockManager::acquire_pcie_resource(PciDeviceConnection &connection, PcieResourceLockKind kind) {
+    const auto descriptor = resource_lock_descriptor(kind);
+    UMD_ASSERT(connection.state != nullptr, error::RuntimeError, "Cannot lock an empty PCIe connection.");
+    auto state = connection.state;
+    state->require_valid();
+    const auto name = get_mutex_name(descriptor.mutex_type, state->device_num, IODeviceType::PCIe);
+    initialize_robust_mutex(name);
+    PcieResourceLock guard(state, get_initialized_mutex(name), descriptor.index);
+    try {
+        guard.robust_->lock();
+    } catch (...) {
+        state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, EIO);
+        state->require_valid();
+    }
+    guard.robust_held_ = true;
+    state->require_valid();
+    while (true) {
+        int acquired = 0;
+        const int result = tt_lock_acquire(state->handle, descriptor.index, &acquired);
+        if (result != 0) {
+            state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, -result);
+            guard.release();
+            state->require_valid();
+        }
+        if (acquired == 1) {
+            guard.kmd_held_ = true;
+            return guard;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        state->require_valid();
+    }
+}
+
+std::optional<std::pair<pid_t, pid_t>> LockManager::probe_pcie_resource(
+    PciDeviceConnection &connection, PcieResourceLockKind kind) {
+    const auto descriptor = resource_lock_descriptor(kind);
+    UMD_ASSERT(connection.state != nullptr, error::RuntimeError, "Cannot probe an empty PCIe connection.");
+    auto state = connection.state;
+    state->require_valid();
+    const auto name = get_mutex_name(descriptor.mutex_type, state->device_num, IODeviceType::PCIe);
+    initialize_robust_mutex(name);
+    auto &robust = get_initialized_mutex(name);
+    if (const auto owner = robust.probe_lock(std::chrono::seconds(0)))
+        return owner;
+    PcieResourceLock guard(state, robust, descriptor.index);
+    guard.robust_held_ = true;
+    state->require_valid();
+    int acquired = 0;
+    const int result = tt_lock_acquire(state->handle, descriptor.index, &acquired);
+    if (result != 0) {
+        state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, -result);
+        guard.release();
+        state->require_valid();
+    }
+    guard.kmd_held_ = acquired == 1;
+    guard.unlock();
+    if (acquired == 0)
+        return std::make_pair(static_cast<pid_t>(0), static_cast<pid_t>(0));
+    return std::nullopt;
+}
 
 std::string to_string(MutexType mutex_type) { return MUTEX_TYPE_TO_STRING.at(mutex_type); }
 
@@ -189,6 +323,7 @@ void LockManager::initialize_mutex(MutexType mutex_type) {
 }
 
 void LockManager::initialize_mutex(MutexType mutex_type, int device_id, IODeviceType device_type) {
+    reject_numeric_pcie_resource(mutex_type, device_type);
     if (device_type == IODeviceType::PCIe) {
         initialize_kmd_mutex(mutex_type, device_id);
     } else {
@@ -202,6 +337,7 @@ std::unique_lock<MutexInterface> LockManager::acquire_mutex(MutexType mutex_type
 
 std::unique_lock<MutexInterface> LockManager::acquire_mutex(
     MutexType mutex_type, int device_id, IODeviceType device_type) {
+    reject_numeric_pcie_resource(mutex_type, device_type);
     if (device_type == IODeviceType::PCIe) {
         return acquire_kmd_mutex(mutex_type, device_id);
     }
@@ -214,6 +350,7 @@ std::optional<std::pair<pid_t, pid_t>> LockManager::probe_mutex(MutexType mutex_
 
 std::optional<std::pair<pid_t, pid_t>> LockManager::probe_mutex(
     MutexType mutex_type, int device_id, IODeviceType device_type) {
+    reject_numeric_pcie_resource(mutex_type, device_type);
     if (device_type == IODeviceType::PCIe) {
         return probe_kmd_mutex(mutex_type, device_id);
     }

@@ -24,10 +24,37 @@
 #include "umd/device/types/host_memory.hpp"
 #include "umd/device/types/tlb.hpp"
 #include "umd/device/utils/semver.hpp"
+#include "umd/device/utils/error.hpp"
 
 struct tt_device_t;
 
 namespace tt::umd {
+
+enum class PciDeviceConnectionMode { Ordinary, LockOnly };
+enum class PciDeviceConnectionStatus { Ready, LockAcquireFailed, LockReleaseFailed };
+
+struct PciDeviceConnectionFailure {
+    int device_num;
+    PciDeviceConnectionStatus status;
+    int error_code;
+};
+
+namespace error {
+struct PciDeviceConnectionError : UmdError<PciDeviceConnectionFailure> {
+    explicit PciDeviceConnectionError(PciDeviceConnectionFailure failure) :
+        UmdError<PciDeviceConnectionFailure>(
+            fmt::format(
+                "PCI device {} connection quarantined after {} failure (errno {}).",
+                failure.device_num,
+                failure.status == PciDeviceConnectionStatus::LockAcquireFailed ? "lock acquisition" : "lock release",
+                failure.error_code),
+            failure) {}
+};
+}  // namespace error
+
+struct PciDeviceConnectionState;
+class LockManager;
+class PcieResourceLock;
 
 struct PciDeviceInfo {
     uint16_t vendor_id;
@@ -117,10 +144,42 @@ enum class TenstorrentResetDevice : uint32_t {
     POST_RESET = 6,
 };
 
+// One open file description owns every query, mapping and driver resource for
+// a PCIDevice. Moving this object transfers that ownership without reopening.
+class PciDeviceConnection {
+public:
+    explicit PciDeviceConnection(
+        int pci_device_number, PciDeviceConnectionMode mode = PciDeviceConnectionMode::Ordinary);
+    ~PciDeviceConnection();
+
+    PciDeviceConnection(PciDeviceConnection &&other) noexcept;
+    PciDeviceConnection &operator=(PciDeviceConnection &&other) = delete;
+    PciDeviceConnection(const PciDeviceConnection &) = delete;
+    PciDeviceConnection &operator=(const PciDeviceConnection &) = delete;
+
+    int get_device_num() const { return pci_device_num; }
+    tt_device_t *get_handle() const;
+    bool is_valid() const noexcept;
+
+private:
+    friend class PCIDevice;
+    friend class LockManager;
+    friend class PcieResourceLock;
+    tt_device_t *get_cleanup_handle() const noexcept;
+    PciDeviceConnection require_ordinary() &&;
+    const int pci_device_num;
+    std::shared_ptr<PciDeviceConnectionState> state;
+};
+
 class PCIDevice {
-    const std::string device_path;   // Path to character device: /dev/tenstorrent/N
+    friend class SiliconTlbHandle;
+    friend class BlackholeTTDevice;
+    tt_device_t *get_cleanup_handle() const noexcept { return connection.get_cleanup_handle(); }
+    void *get_cleanup_bar2_uc() const noexcept { return bar2_uc; }
+    // Declared first so that mappings and other device resources retire before
+    // the retained driver connection is destroyed.
+    PciDeviceConnection connection;
     const int pci_device_num;        // N in /dev/tenstorrent/N
-    const int pci_device_file_desc;  // Character device file descriptor
     const PciDeviceInfo info;        // PCI device info
     const int numa_node;             // -1 if non-NUMA
     const int revision;              // PCI revision value from sysfs
@@ -168,6 +227,15 @@ public:
      * @param pci_device_number     N in /dev/tenstorrent/N
      */
     PCIDevice(int pci_device_number);
+
+    /**
+     * Construct from an already retained connection without opening the device.
+     */
+    explicit PCIDevice(PciDeviceConnection connection);
+
+    // Re-query the retained connection and reject changed selection identity
+    // before mapping BARs or allocating device resources.
+    PCIDevice(PciDeviceConnection connection, const PciDeviceInfo &selected_info);
 
     /**
      * PCIDevice destructor.
@@ -265,7 +333,10 @@ public:
      * It is the caller's responsibility to check if the buffer is valid and to
      * chunk the desired transfer size to fit within it.
      */
-    DmaBuffer &get_dma_buffer() { return dma_buffer; }
+    DmaBuffer &get_dma_buffer() {
+        connection.get_handle();
+        return dma_buffer;
+    }
 
     /**
      * Unmap a buffer that was previously mapped for DMA access.
@@ -382,27 +453,51 @@ public:
      * Get the tt_device handle for low-level operations.
      * @return Pointer to the tt_device handle
      */
-    tt_device_t *get_tt_device_handle() const { return tt_device_handle; }
+    tt_device_t *get_tt_device_handle() const { return connection.get_handle(); }
+    PciDeviceConnection &get_connection() { return connection; }
 
     /**
      * Get the TLB configuration space mapping.
      * @return Pointer to the TLB configuration space
      */
-    void *get_tlb_config_space() const { return tlb_config_space; }
+    void *get_tlb_config_space() const {
+        connection.get_handle();
+        return tlb_config_space;
+    }
 
-    // BAR0 base. UMD maps ARC memory to user space.
-    void *bar0 = nullptr;
+    void *get_bar0() const {
+        connection.get_handle();
+        return bar0;
+    }
+
+    void *get_bar2_uc() const {
+        connection.get_handle();
+        return bar2_uc;
+    }
+
     // We only map 3MB of BAR0, which covers NOC2AXI access and ARC CSM memory.
     static constexpr size_t bar0_size = 3 * (1 << 20);
     // TLB configuration space size (4KB page).
     static constexpr size_t tlb_config_space_size = 4 * (1 << 10);
 
-    void *bar2_uc = nullptr;
-    size_t bar2_uc_size;
-
     uint32_t read_checking_offset;
 
 private:
+    // Mappings are borrowed only through checked normal accessors. Destruction
+    // uses private cleanup access while the original connection still lives.
+    void *bar0 = nullptr;
+    void *bar2_uc = nullptr;
+    size_t bar2_uc_size = 0;
+
+    static PciDeviceInfo read_device_info(tt_device_t *handle);
+    static PciDeviceInfo read_device_info(
+        tt_device_t *handle, const std::optional<PciDeviceInfo> &selected_info);
+    PCIDevice(PciDeviceConnection connection, std::optional<PciDeviceInfo> selected_info);
+
+    // Shared by destruction and constructor rollback; the connection remains
+    // alive until every owned mapping and pin has been released.
+    void release_mappings() noexcept;
+
     /**
      * Function will allocate PCIe DMA buffer that UMD uses for PCIe DMA transfers. To make the process of allocation
      * robust, allocation tries to allocate larger DMA buffers first and then shrinks the size until it reaches the
@@ -446,8 +541,6 @@ private:
     static std::map<std::string, int> get_bdf_to_device_id_map();
 
     static constexpr size_t bar0_mapping_offset = 509 * (1 << 20);
-
-    tt_device_t *tt_device_handle = nullptr;
 
     // TLB configuration registers mapped space.
     void *tlb_config_space = nullptr;

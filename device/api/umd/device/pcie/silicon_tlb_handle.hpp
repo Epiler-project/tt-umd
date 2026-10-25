@@ -43,6 +43,7 @@ public:
     ~SiliconTlbHandle() noexcept override;
 
     void configure(const tlb_data& new_config) override;
+    uint8_t* get_base() const override;
 
     tt::ARCH get_arch() const override;
 

@@ -6,6 +6,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -51,14 +52,15 @@ namespace tt::umd {
 std::unique_ptr<TopologyDiscovery> TopologyDiscovery::create_topology_discovery(
     const TopologyDiscoveryOptions& options, IODeviceType io_device_type, const std::string& soc_descriptor_path) {
     tt::ARCH current_arch = ARCH::Invalid;
+    std::map<int, PciDeviceInfo> selected_pci_devices;
 
     switch (io_device_type) {
         case IODeviceType::PCIe: {
-            auto pci_devices_info = PCIDevice::enumerate_devices_info();
-            if (pci_devices_info.empty()) {
+            selected_pci_devices = PCIDevice::enumerate_devices_info();
+            if (selected_pci_devices.empty()) {
                 return nullptr;
             }
-            current_arch = pci_devices_info.begin()->second.get_arch();
+            current_arch = selected_pci_devices.begin()->second.get_arch();
             break;
         }
         case IODeviceType::JTAG: {
@@ -94,14 +96,29 @@ std::unique_ptr<TopologyDiscovery> TopologyDiscovery::create_topology_discovery(
     }
 
     log_info(LogUMD, "Creating TopologyDiscovery for architecture: {}", arch_to_str(current_arch));
+    std::unique_ptr<TopologyDiscovery> discovery;
     switch (current_arch) {
         case tt::ARCH::WORMHOLE_B0:
-            return std::make_unique<TopologyDiscoveryWormhole>(soc_arch_descriptor, options, io_device_type);
+            discovery = std::make_unique<TopologyDiscoveryWormhole>(soc_arch_descriptor, options, io_device_type);
+            break;
         case tt::ARCH::BLACKHOLE:
-            return std::make_unique<TopologyDiscoveryBlackhole>(soc_arch_descriptor, options, io_device_type);
+            discovery = std::make_unique<TopologyDiscoveryBlackhole>(soc_arch_descriptor, options, io_device_type);
+            break;
         default:
             UMD_THROW(error::RuntimeError, fmt::format("Unsupported architecture for topology discovery."));
     }
+    for (const auto& [device_id, selected_info] : selected_pci_devices) {
+        // O_APPEND metadata discovery is selection only, not a retained
+        // identity. Acquire ordinary power mode only after visibility filtering
+        // and re-query this actual handle before any BAR or DMA side effect.
+        discovery->pci_devices_.push_back(
+            std::make_unique<PCIDevice>(PciDeviceConnection(device_id), selected_info));
+    }
+    std::stable_sort(
+        discovery->pci_devices_.begin(), discovery->pci_devices_.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs->get_device_info().pci_bdf < rhs->get_device_info().pci_bdf;
+        });
+    return discovery;
 }
 
 TopologyDiscovery::TopologyDiscovery(
@@ -159,7 +176,11 @@ void TopologyDiscovery::get_connected_devices() {
     std::vector<int> local_device_ids;
     switch (io_device_type) {
         case IODeviceType::PCIe: {
-            local_device_ids = PCIDevice::enumerate_devices();
+            for (const auto& pci_device : pci_devices_) {
+                if (pci_device != nullptr) {
+                    local_device_ids.push_back(pci_device->get_device_num());
+                }
+            }
             break;
         }
         case IODeviceType::JTAG: {
@@ -172,9 +193,18 @@ void TopologyDiscovery::get_connected_devices() {
             UMD_THROW(error::RuntimeError, "Unsupported device type.");
     }
 
+    size_t next_pci_device = 0;
     for (auto& device_id : local_device_ids) {
-        std::unique_ptr<TTDevice> tt_device =
-            TTDevice::create(device_id, io_device_type, options.use_safe_api, soc_arch_descriptor_);
+        std::unique_ptr<TTDevice> tt_device;
+        if (io_device_type == IODeviceType::PCIe) {
+            while (pci_devices_[next_pci_device] == nullptr) {
+                ++next_pci_device;
+            }
+            tt_device = TTDevice::create(
+                std::move(pci_devices_[next_pci_device++]), options.use_safe_api, soc_arch_descriptor_);
+        } else {
+            tt_device = TTDevice::create(device_id, io_device_type, options.use_safe_api, soc_arch_descriptor_);
+        }
         if (options.low_power) {
             // Low power mode is temporarily disabled. See https://github.com/tenstorrent/tt-umd/issues/2531.
             log_warning(

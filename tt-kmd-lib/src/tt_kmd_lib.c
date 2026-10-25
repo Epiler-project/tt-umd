@@ -81,12 +81,12 @@ int tt_device_open(const char* chardev_path, tt_device_t** out_dev, int extra_fl
 }
 
 int tt_device_close(tt_device_t* dev) {
-    if (close(dev->fd) != 0) {
-        return -errno;
-    }
-
+    int result = close(dev->fd);
+    int error = result != 0 ? errno : 0;
+    // Linux consumes the descriptor even when close reports an error. Do not
+    // retry it: that descriptor number may already belong to another owner.
     free(dev);
-    return 0;
+    return -error;
 }
 
 int tt_device_get_attrs(tt_device_t* dev, tt_device_attrs_t* out_attrs) {
@@ -259,6 +259,28 @@ int tt_device_query_bar_mappings(tt_device_t* dev, tt_bar_mappings_t* out_mappin
         dst->size = m->mapping_size;
     }
 
+    return 0;
+}
+
+int tt_device_map_bar(tt_device_t* dev, uint64_t offset, size_t size, void** out_mapping) {
+    if (!out_mapping) {
+        return -EINVAL;
+    }
+    *out_mapping = NULL;
+    if (!dev || size == 0) {
+        return -EINVAL;
+    }
+
+    off_t mapping_offset = (off_t)offset;
+    if (mapping_offset < 0 || (uint64_t)mapping_offset != offset) {
+        return -EOVERFLOW;
+    }
+
+    void* mapping = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd, mapping_offset);
+    if (mapping == MAP_FAILED) {
+        return -errno;
+    }
+    *out_mapping = mapping;
     return 0;
 }
 
@@ -739,7 +761,11 @@ int tt_device_reset(tt_device_t* dev, uint32_t reset_flags) {
         return -errno;
     }
 
-    return tt_device_close(dev);
+    if (reset_info.out.output_size_bytes < sizeof(reset_info.out)) {
+        return -EPROTO;
+    }
+
+    return reset_info.out.result == 0 ? 0 : -EIO;
 }
 
 /* All three lock operations issue the same ioctl, differing only in the flag they pass and in how

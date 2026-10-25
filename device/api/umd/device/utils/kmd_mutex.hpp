@@ -49,9 +49,8 @@ namespace tt::umd {
 // This class owns its own dedicated device handle (chardev fd), separate from any fd used to run a
 // workload. That is deliberate: a device reset invalidates every fd that was open across it (further
 // ioctls return ENODEV), but the lock itself survives the reset and stays held until its fd is
-// closed. Keeping the lock on a dedicated handle lets a caller hold the lock, reset the device, then
-// open fresh fds to run a workload. lock() transparently reopens its handle and retries if it
-// observes that a reset happened while it was waiting.
+// closed. Keeping the lock on a dedicated handle lets cleanup close the stale
+// OFD after a reset, but it never reopens that lease in a new reset generation.
 //
 // It meets the C++ Lockable requirement (lock()/try_lock()/unlock()), so it can be used with RAII
 // helpers like std::lock_guard and std::unique_lock.
@@ -74,8 +73,8 @@ public:
     KmdMutex(const KmdMutex&) = delete;
     KmdMutex& operator=(const KmdMutex&) = delete;
 
-    // Blocks until the lock is acquired. If a reset is detected while waiting (the handle becomes
-    // unusable), the handle is transparently reopened and the wait is retried.
+    // Blocks until the lock is acquired. A reset invalidates this lock lease;
+    // the stale OFD is closed and the failure is reported to the caller.
     void lock() override;
 
     // Attempts to acquire without blocking. Returns true if acquired, false if held by another
@@ -99,10 +98,6 @@ public:
 private:
     void open_device();
     void close_device() noexcept;
-
-    // Closes and reopens the handle after a reset made it unusable. Closing is what releases any lock
-    // KMD still has recorded against the old handle. Returns whether the handle is usable again.
-    bool reopen_device() noexcept;
 
     int pci_device_num_;
     uint8_t lock_index_;

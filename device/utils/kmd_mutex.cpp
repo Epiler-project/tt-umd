@@ -74,17 +74,6 @@ void KmdMutex::initialize() {
     open_device();
 }
 
-bool KmdMutex::reopen_device() noexcept {
-    close_device();
-    try {
-        open_device();
-    } catch (const std::exception& e) {
-        log_warning(tt::LogUMD, "Reopening KMD lock device {} failed: {}", device_path_, e.what());
-        return false;
-    }
-    return true;
-}
-
 void KmdMutex::close_device() noexcept {
     if (device_ != nullptr) {
         // Closing the handle releases any lock held on it (enforced by KMD), so this is also our
@@ -104,11 +93,17 @@ bool KmdMutex::try_lock() {
     int acquired = 0;
     int result = tt_lock_acquire(device_, lock_index_, &acquired);
 
-    // A reset across our handle makes it unusable; reopen and retry once on a fresh handle.
+    // A reset across our handle makes this lock lease unusable. The lock belongs
+    // to the original open file description; reopening would silently move the
+    // operation into a new reset generation and let a stale caller continue.
     if (result == -ENODEV) {
         close_device();
-        open_device();
-        result = tt_lock_acquire(device_, lock_index_, &acquired);
+        UMD_THROW(
+            error::RuntimeError,
+            fmt::format(
+                "KMD lock {} on {} became invalid after device reset; the original connection was closed",
+                lock_index_,
+                device_path_));
     }
 
     UMD_ASSERT(
@@ -124,8 +119,8 @@ void KmdMutex::lock() {
 
     // KMD exposes only non-blocking acquire, so a blocking lock is implemented by polling it once a
     // millisecond. This also deliberately avoids KMD's blocking-acquire path, which has had a
-    // deadlock against the reset ioctl. try_lock() already handles a reset (ENODEV) by reopening the
-    // handle.
+    // deadlock against the reset ioctl. try_lock() reports a reset (ENODEV) and
+    // retires the stale lock lease instead of reopening its OFD.
     // A lock that is taking a while is reported once, the way RobustMutex reports it, so that a lock
     // nobody releases shows up in the log instead of looking like a hang. KMD does not say which
     // handle holds the lock, so there is no owner to name.
@@ -172,17 +167,19 @@ void KmdMutex::unlock() {
     int was_held = 0;
     int result = tt_lock_release(device_, lock_index_, &was_held);
 
-    // A reset made the handle unusable, and the release did not go through. KMD still has the lock
-    // recorded against the old handle and only closing it gives the lock back, so close here rather
-    // than leaving it held for as long as this object lives - which, since locks are kept for the
-    // lifetime of the process, would be until the process exits.
+    // A reset made the handle unusable, and the release did not go through. KMD
+    // still has the lock recorded against the old handle and only closing it
+    // gives the lock back. Close it, then report the stale generation instead
+    // of reopening and silently changing the lease's OFD. Release is already
+    // complete from the caller's RAII perspective; the next use will fail
+    // because this lease no longer owns an initialized connection.
     if (result == -ENODEV) {
+        close_device();
         log_warning(
             tt::LogUMD,
-            "tt_lock_release() for lock {} on {} hit ENODEV (device reset); reopening the handle to release it",
+            "KMD lock {} on {} became invalid during release after device reset; the original connection was closed",
             lock_index_,
             device_path_);
-        reopen_device();
         return;
     }
 

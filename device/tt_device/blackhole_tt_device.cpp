@@ -51,8 +51,10 @@ BlackholeTTDevice::~BlackholeTTDevice() {
     if (get_communication_device_type() != IODeviceType::PCIe) {
         return;
     }
-    if (get_pci_device()->bar2_uc != nullptr && get_pci_device()->bar2_uc != MAP_FAILED) {
-        auto *bar2 = static_cast<volatile uint8_t *>(get_pci_device()->bar2_uc);
+    // Retirement must remain possible after ordinary I/O has been quarantined.
+    void *const cleanup_bar2 = get_pci_device()->get_cleanup_bar2_uc();
+    if (cleanup_bar2 != nullptr && cleanup_bar2 != MAP_FAILED) {
+        auto *bar2 = static_cast<volatile uint8_t *>(cleanup_bar2);
 
         for (size_t region : iatu_regions_) {
             uint64_t iatu_base = ATU_OFFSET_IN_BH_BAR2 + (region * 0x200);
@@ -65,7 +67,7 @@ BlackholeTTDevice::~BlackholeTTDevice() {
 void BlackholeTTDevice::configure_iatu_region(size_t region, uint64_t target, size_t region_size) {
     uint64_t base = region * region_size;
     uint64_t iatu_base = ATU_OFFSET_IN_BH_BAR2 + (region * 0x200);
-    auto *bar2 = static_cast<volatile uint8_t *>(get_pci_device()->bar2_uc);
+    auto *bar2 = static_cast<volatile uint8_t *>(get_pci_device()->get_bar2_uc());
 
     if (region_size % (1ULL << 30) != 0 || region_size > (1ULL << 32)) {
         // If you hit this, the suggestion is to not use iATU: map your buffer

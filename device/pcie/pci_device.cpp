@@ -30,6 +30,8 @@
 #include <utility>
 #include <vector>
 
+#include "pcie/pci_device_reset.hpp"
+#include "pcie/pci_device_connection_state.hpp"
 #include "tracy.hpp"
 #include "tt-kmd-lib/pci_ids.h"
 #include "tt-kmd-lib/tt_kmd_lib.h"
@@ -172,6 +174,59 @@ static std::optional<int> get_physical_slot_for_pcie_bdf(const std::string &targ
     return std::nullopt;
 }
 
+PciDeviceConnection::PciDeviceConnection(int pci_device_number, PciDeviceConnectionMode mode) :
+    pci_device_num(pci_device_number) {
+    const auto path = fmt::format("/dev/tenstorrent/{}", pci_device_number);
+    tt_device_t *handle = nullptr;
+    const int result = tt_device_open(path.c_str(), &handle, mode == PciDeviceConnectionMode::LockOnly ? O_APPEND : 0);
+    if (result != 0) {
+        UMD_THROW(error::RuntimeError, fmt::format("Failed to open device {}: {}", path, strerror(-result)));
+    }
+    std::unique_ptr<tt_device_t, decltype(&tt_device_close)> owner(handle, &tt_device_close);
+    state = std::make_shared<PciDeviceConnectionState>(pci_device_number, mode, handle);
+    owner.release();
+}
+
+PciDeviceConnection::PciDeviceConnection(PciDeviceConnection &&other) noexcept :
+    pci_device_num(other.pci_device_num), state(std::move(other.state)) {}
+
+PciDeviceConnection::~PciDeviceConnection() = default;
+
+PciDeviceConnectionState::~PciDeviceConnectionState() noexcept {
+    const int result = tt_device_close(handle);
+    if (result != 0) {
+        log_warning(
+            LogUMD,
+            "tt_device_close failed with error code {} for PCI device with device ID {}.",
+            result,
+            device_num);
+    }
+}
+
+tt_device_t *PciDeviceConnection::get_handle() const {
+    if (state == nullptr)
+        return nullptr;
+    state->require_valid();
+    return state->handle;
+}
+
+tt_device_t *PciDeviceConnection::get_cleanup_handle() const noexcept {
+    return state == nullptr ? nullptr : state->handle;
+}
+
+bool PciDeviceConnection::is_valid() const noexcept {
+    return state != nullptr && state->first_failure.load(std::memory_order_acquire) == 0;
+}
+
+PciDeviceConnection PciDeviceConnection::require_ordinary() && {
+    UMD_ASSERT(
+        state != nullptr && state->mode == PciDeviceConnectionMode::Ordinary,
+        error::RuntimeError,
+        "PCIDevice resources require an ordinary PCIe connection, not a lock-only observer.");
+    state->require_valid();
+    return std::move(*this);
+}
+
 PciDeviceInfo PCIDevice::read_device_info(const std::string &device_path) {
     tt_device_t *dev_handle = nullptr;
     int err = tt_device_open(device_path.c_str(), &dev_handle, O_APPEND);
@@ -179,12 +234,18 @@ PciDeviceInfo PCIDevice::read_device_info(const std::string &device_path) {
         UMD_THROW(error::RuntimeError, fmt::format("Failed to open device {}: {}", device_path, strerror(-err)));
     }
 
+    std::unique_ptr<tt_device_t, decltype(&tt_device_close)> owner(dev_handle, &tt_device_close);
+    return read_device_info(owner.get());
+}
+
+PciDeviceInfo PCIDevice::read_device_info(tt_device_t *handle) {
+    if (handle == nullptr) {
+        UMD_THROW(error::RuntimeError, "Cannot read device info from an empty PCI device connection.");
+    }
     tt_device_attrs_t attrs{};
-    err = tt_device_get_attrs(dev_handle, &attrs);
-    tt_device_close(dev_handle);
+    const int err = tt_device_get_attrs(handle, &attrs);
     if (err != 0) {
-        UMD_THROW(
-            error::RuntimeError, fmt::format("Failed to read device info for {}: {}", device_path, strerror(-err)));
+        UMD_THROW(error::RuntimeError, fmt::format("Failed to read device info: {}", strerror(-err)));
     }
 
     uint16_t bus = static_cast<uint16_t>(attrs.pci_bus);
@@ -206,22 +267,23 @@ PciDeviceInfo PCIDevice::read_device_info(const std::string &device_path) {
         get_physical_slot_for_pcie_bdf(pci_bdf)};
 }
 
-static void send_reset_ioctl(int device_id, uint32_t flags) {
-    log_debug(tt::LogUMD, "Attempting to reset PCI device ID {} with flags {}", device_id, flags);
-    std::string device_path = fmt::format("/dev/tenstorrent/{}", device_id);
-    tt_device_t *dev = nullptr;
-    int err = tt_device_open(device_path.c_str(), &dev, O_RDWR | O_CLOEXEC | O_APPEND);
-    if (err != 0) {
-        UMD_THROW(error::RuntimeError, fmt::format("Failed to open device {}: {}", device_id, strerror(-err)));
-    }
-
-    err = tt_device_reset(dev, flags);
-    if (err != 0) {
-        UMD_THROW(
+PciDeviceInfo PCIDevice::read_device_info(
+    tt_device_t *handle, const std::optional<PciDeviceInfo> &selected_info) {
+    auto actual = read_device_info(handle);
+    if (selected_info) {
+        const auto &selected = *selected_info;
+        const bool same_identity =
+            actual.vendor_id == selected.vendor_id && actual.device_id == selected.device_id &&
+            actual.subsystem_vendor_id == selected.subsystem_vendor_id &&
+            actual.subsystem_id == selected.subsystem_id && actual.pci_domain == selected.pci_domain &&
+            actual.pci_bus == selected.pci_bus && actual.pci_device == selected.pci_device &&
+            actual.pci_function == selected.pci_function;
+        UMD_ASSERT(
+            same_identity,
             error::RuntimeError,
-            fmt::format(
-                "Sending reset command failed on device {} with flags {:#x}: {}", device_id, flags, strerror(-err)));
+            "Selected PCI device identity changed before acquiring its retained connection.");
     }
+    return actual;
 }
 
 tt::ARCH PciDeviceInfo::get_arch() const {
@@ -377,19 +439,18 @@ std::optional<int> PCIDevice::get_pci_device_id(int umd_logical_id) {
     return enumerated_ids[umd_logical_id];
 }
 
-static int open_pci_device(const std::string &device_path) {
-    // O_APPEND is temporarily disabled to investigate NOC1 issues. See
-    // https://github.com/tenstorrent/tt-umd/issues/2531.
-    int flags = O_RDWR | O_CLOEXEC;
-    log_debug(LogUMD, fmt::format("Opening device {} in legacy mode regarding device power.", device_path));
-    return open(device_path.c_str(), flags);
-}
+PCIDevice::PCIDevice(int pci_device_number) : PCIDevice(PciDeviceConnection(pci_device_number)) {}
 
-PCIDevice::PCIDevice(int pci_device_number) :
-    device_path(fmt::format("/dev/tenstorrent/{}", pci_device_number)),
-    pci_device_num(pci_device_number),
-    pci_device_file_desc(open_pci_device(device_path)),
-    info(read_device_info(device_path)),
+PCIDevice::PCIDevice(PciDeviceConnection retained_connection) :
+    PCIDevice(std::move(retained_connection), std::optional<PciDeviceInfo>{}) {}
+
+PCIDevice::PCIDevice(PciDeviceConnection retained_connection, const PciDeviceInfo &selected_info) :
+    PCIDevice(std::move(retained_connection), std::optional<PciDeviceInfo>{selected_info}) {}
+
+PCIDevice::PCIDevice(PciDeviceConnection retained_connection, std::optional<PciDeviceInfo> selected_info) :
+    connection(std::move(retained_connection).require_ordinary()),
+    pci_device_num(this->connection.get_device_num()),
+    info(read_device_info(this->connection.get_handle(), selected_info)),
     numa_node(read_sysfs<int>(info, "numa_node", -1)),  // default to -1 if not found
     revision(read_sysfs<int>(info, "revision")),
     arch(info.get_arch()),
@@ -401,170 +462,138 @@ PCIDevice::PCIDevice(int pci_device_number) :
             fmt::format("Running UMD requires KMD version {} or newer.", KMD_MINIMUM_VERSION.to_string()));
     }
 
-    int extra_flags = 0;
-    int ret_code = tt_device_open(device_path.c_str(), &tt_device_handle, extra_flags);
+    try {
+        uint64_t driver_api_version = 0;
+        tt_driver_get_attr(connection.get_handle(), tt_driver_attr::TT_DRIVER_API_VERSION, &driver_api_version);
 
-    if (ret_code != 0) {
-        if (tt_device_handle != nullptr) {
-            tt_device_close(tt_device_handle);
-        }
-        UMD_THROW(
-            error::RuntimeError,
-            fmt::format(
-                "tt_device_open failed with error code {} for PCI device with device ID {}.",
-                ret_code,
-                pci_device_number));
-    }
-
-    uint64_t driver_api_version = 0;
-    tt_driver_get_attr(tt_device_handle, tt_driver_attr::TT_DRIVER_API_VERSION, &driver_api_version);
-
-    log_debug(
-        LogUMD,
-        "Opened PCI device {}; KMD version: {} (API version: {}); IOMMU: {}",
-        pci_device_num,
-        kmd_version.to_string(),
-        driver_api_version,
-        iommu_enabled ? "enabled" : "disabled");
-
-    UMD_ASSERT(
-        arch != tt::ARCH::WORMHOLE_B0 || revision == 0x01, error::RuntimeError, "Wormhole B0 must have revision 0x01");
-
-    // Mapping resource to BAR
-    // Resource 0 -> BAR0
-    // Resource 1 -> BAR2
-    // Resource 2 -> BAR4.
-    tt_bar_mappings_t bar_mappings{};
-    int mappings_ret = tt_device_query_bar_mappings(tt_device_handle, &bar_mappings);
-    if (mappings_ret != 0) {
-        UMD_THROW(
-            error::RuntimeError,
-            fmt::format("Query mappings failed on device {}: {}", pci_device_num, strerror(-mappings_ret)));
-    }
-
-    const tt_bar_mapping_t &bar0_uc_mapping = bar_mappings.resource0_uc;
-    const tt_bar_mapping_t &bar2_uc_mapping = bar_mappings.resource1_uc;
-    const tt_bar_mapping_t &bar4_uc_mapping = bar_mappings.resource2_uc;
-
-    for (const tt_bar_mapping_t &mapping :
-         {bar_mappings.resource0_uc,
-          bar_mappings.resource0_wc,
-          bar_mappings.resource1_uc,
-          bar_mappings.resource1_wc,
-          bar_mappings.resource2_uc,
-          bar_mappings.resource2_wc}) {
-        if (mapping.id == TT_BAR_MAPPING_UNUSED) {
-            continue;
-        }
-        log_trace(
+        log_debug(
             LogUMD,
-            "BAR mapping id {} base {} size {}",
-            mapping.id,
-            reinterpret_cast<void *>(mapping.base),
-            mapping.size);
-    }
+            "Opened PCI device {}; KMD version: {} (API version: {}); IOMMU: {}",
+            pci_device_num,
+            kmd_version.to_string(),
+            driver_api_version,
+            iommu_enabled ? "enabled" : "disabled");
 
-    if (bar0_uc_mapping.id != TT_BAR_MAPPING_RESOURCE0_UC) {
-        UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR0 UC mapping.", pci_device_num));
-    }
+        UMD_ASSERT(
+            arch != tt::ARCH::WORMHOLE_B0 || revision == 0x01, error::RuntimeError, "Wormhole B0 must have revision 0x01");
 
-    bar0 = mmap(
-        nullptr,
-        PCIDevice::bar0_size,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        pci_device_file_desc,
-        bar0_uc_mapping.base + PCIDevice::bar0_mapping_offset);
-
-    if (bar0 == MAP_FAILED) {
-        UMD_THROW(error::RuntimeError, fmt::format("BAR0 mapping failed for device {}.", pci_device_num));
-    }
-
-    // Map TLB configuration registers. Wormhole has up to 186 TLBs and Blackhole up to 202 TLBs; with
-    // approximately 8–12 bytes per TLB configuration register, the maximum required space is about
-    // 202 * 12 = 2424 bytes, which fits comfortably in a single 4 KB page.
-    tlb_config_space = mmap(
-        nullptr,
-        tlb_config_space_size,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        pci_device_file_desc,
-        bar0_uc_mapping.base + get_architecture_tlbs(arch).static_cfg_addr);
-
-    if (tlb_config_space == MAP_FAILED) {
-        UMD_THROW(
-            error::RuntimeError,
-            fmt::format("TLB configuration registers mapping failed for device {}.", pci_device_num));
-    }
-
-    if (arch == tt::ARCH::WORMHOLE_B0) {
-        if (bar4_uc_mapping.id != TT_BAR_MAPPING_RESOURCE2_UC) {
-            UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR4 UC mapping.", pci_device_num));
+        // Mapping resource to BAR
+        // Resource 0 -> BAR0
+        // Resource 1 -> BAR2
+        // Resource 2 -> BAR4.
+        tt_bar_mappings_t bar_mappings{};
+        int mappings_ret = tt_device_query_bar_mappings(connection.get_handle(), &bar_mappings);
+        if (mappings_ret != 0) {
+            UMD_THROW(
+                error::RuntimeError,
+                fmt::format("Query mappings failed on device {}: {}", pci_device_num, strerror(-mappings_ret)));
         }
 
-        bar2_uc_size = bar2_uc_mapping.size;
-        bar2_uc = mmap(
-            nullptr,
-            bar2_uc_mapping.size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            pci_device_file_desc,
-            bar2_uc_mapping.base);
+        const tt_bar_mapping_t &bar0_uc_mapping = bar_mappings.resource0_uc;
+        const tt_bar_mapping_t &bar2_uc_mapping = bar_mappings.resource1_uc;
+        const tt_bar_mapping_t &bar4_uc_mapping = bar_mappings.resource2_uc;
 
-        if (bar2_uc == MAP_FAILED) {
-            UMD_THROW(error::RuntimeError, fmt::format("BAR2 UC mapping failed for device {}.", pci_device_num));
-        }
-    } else if (arch == tt::ARCH::BLACKHOLE) {
-        if (bar2_uc_mapping.id != TT_BAR_MAPPING_RESOURCE1_UC) {
-            UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR2 UC mapping.", pci_device_num));
+        for (const tt_bar_mapping_t &mapping :
+             {bar_mappings.resource0_uc,
+              bar_mappings.resource0_wc,
+              bar_mappings.resource1_uc,
+              bar_mappings.resource1_wc,
+              bar_mappings.resource2_uc,
+              bar_mappings.resource2_wc}) {
+            if (mapping.id == TT_BAR_MAPPING_UNUSED) {
+                continue;
+            }
+            log_trace(
+                LogUMD,
+                "BAR mapping id {} base {} size {}",
+                mapping.id,
+                reinterpret_cast<void *>(mapping.base),
+                mapping.size);
         }
 
-        // Using UnCachable memory mode. This is used for accessing registers on Blackhole.
-        bar2_uc_size = bar2_uc_mapping.size;
-        bar2_uc = mmap(
-            nullptr,
-            bar2_uc_mapping.size,
-            PROT_READ | PROT_WRITE,
-            MAP_SHARED,
-            pci_device_file_desc,
-            bar2_uc_mapping.base);
-
-        if (bar2_uc == MAP_FAILED) {
-            UMD_THROW(error::RuntimeError, fmt::format("BAR2 UC mapping failed for device {}.", pci_device_num));
+        if (bar0_uc_mapping.id != TT_BAR_MAPPING_RESOURCE0_UC) {
+            UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR0 UC mapping.", pci_device_num));
         }
+
+        if (tt_device_map_bar(
+                connection.get_handle(),
+                bar0_uc_mapping.base + PCIDevice::bar0_mapping_offset,
+                PCIDevice::bar0_size,
+                &bar0) != 0) {
+            UMD_THROW(error::RuntimeError, fmt::format("BAR0 mapping failed for device {}.", pci_device_num));
+        }
+
+        // Map TLB configuration registers. Wormhole has up to 186 TLBs and Blackhole up to 202 TLBs; with
+        // approximately 8–12 bytes per TLB configuration register, the maximum required space is about
+        // 202 * 12 = 2424 bytes, which fits comfortably in a single 4 KB page.
+        if (tt_device_map_bar(
+                connection.get_handle(),
+                bar0_uc_mapping.base + get_architecture_tlbs(arch).static_cfg_addr,
+                tlb_config_space_size,
+                &tlb_config_space) != 0) {
+            UMD_THROW(
+                error::RuntimeError,
+                fmt::format("TLB configuration registers mapping failed for device {}.", pci_device_num));
+        }
+
+        if (arch == tt::ARCH::WORMHOLE_B0) {
+            if (bar4_uc_mapping.id != TT_BAR_MAPPING_RESOURCE2_UC) {
+                UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR4 UC mapping.", pci_device_num));
+            }
+
+            bar2_uc_size = bar2_uc_mapping.size;
+            if (tt_device_map_bar(
+                    connection.get_handle(), bar2_uc_mapping.base, bar2_uc_mapping.size, &bar2_uc) != 0) {
+                UMD_THROW(error::RuntimeError, fmt::format("BAR2 UC mapping failed for device {}.", pci_device_num));
+            }
+        } else if (arch == tt::ARCH::BLACKHOLE) {
+            if (bar2_uc_mapping.id != TT_BAR_MAPPING_RESOURCE1_UC) {
+                UMD_THROW(error::RuntimeError, fmt::format("Device {} has no BAR2 UC mapping.", pci_device_num));
+            }
+
+            // Using UnCachable memory mode. This is used for accessing registers on Blackhole.
+            bar2_uc_size = bar2_uc_mapping.size;
+            if (tt_device_map_bar(
+                    connection.get_handle(), bar2_uc_mapping.base, bar2_uc_mapping.size, &bar2_uc) != 0) {
+                UMD_THROW(error::RuntimeError, fmt::format("BAR2 UC mapping failed for device {}.", pci_device_num));
+            }
+        }
+
+        allocate_pcie_dma_buffer();
+    } catch (...) {
+        release_mappings();
+        throw;
     }
-
-    allocate_pcie_dma_buffer();
 }
 
-PCIDevice::~PCIDevice() {
-    int ret_code = tt_device_close(tt_device_handle);
+PCIDevice::~PCIDevice() { release_mappings(); }
 
-    if (ret_code != 0) {
-        log_warning(
-            LogUMD,
-            "tt_device_close failed with error code {} for PCI device with device ID {}.",
-            ret_code,
-            pci_device_num);
+void PCIDevice::release_mappings() noexcept {
+    if (dma_buffer.buffer != nullptr && dma_buffer.buffer != MAP_FAILED) {
+        const auto mapping_size = dma_buffer.size + static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        if (iommu_enabled) {
+            const int result = tt_unpin_pages(connection.get_cleanup_handle(), dma_buffer.buffer, mapping_size);
+            if (result != 0) {
+                log_warning(LogUMD, "Failed to unpin PCIe DMA buffer for device {}: {}", pci_device_num, strerror(-result));
+            }
+        }
+        TracyFreeN(dma_buffer.buffer, "DMA");
+        munmap(dma_buffer.buffer, mapping_size);
+        dma_buffer = {};
     }
-
-    close(pci_device_file_desc);
-
     if (bar0 != nullptr && bar0 != MAP_FAILED) {
         munmap(bar0, bar0_size);
+        bar0 = nullptr;
     }
 
     if (tlb_config_space != nullptr && tlb_config_space != MAP_FAILED) {
         munmap(tlb_config_space, tlb_config_space_size);
+        tlb_config_space = nullptr;
     }
 
     if (bar2_uc != nullptr && bar2_uc != MAP_FAILED) {
         munmap(bar2_uc, bar2_uc_size);
-    }
-
-    if (dma_buffer.buffer != nullptr && dma_buffer.buffer != MAP_FAILED) {
-        TracyFreeN(dma_buffer.buffer, "DMA");
-        munmap(dma_buffer.buffer, dma_buffer.size + static_cast<size_t>(sysconf(_SC_PAGESIZE)));
+        bar2_uc = nullptr;
     }
 }
 
@@ -573,7 +602,7 @@ uint64_t PCIDevice::map_for_hugepage(void *buffer, size_t size) {
     const int flags = TT_DMA_FLAG_CONTIGUOUS;
 
     uint64_t physical_address = 0;
-    int ret = tt_pin_pages(tt_device_handle, buffer, size, flags, &physical_address, nullptr);
+    int ret = tt_pin_pages(connection.get_handle(), buffer, size, flags, &physical_address, nullptr);
     if (ret != 0) {
         log_warning(
             LogUMD,
@@ -626,7 +655,7 @@ std::pair<uint64_t, uint64_t> PCIDevice::map_buffer_to_noc(
 
     uint64_t physical_address = 0;
     uint64_t noc_address = 0;
-    int ret = tt_pin_pages(tt_device_handle, buffer, size, flags, &physical_address, &noc_address);
+    int ret = tt_pin_pages(connection.get_handle(), buffer, size, flags, &physical_address, &noc_address);
     if (ret != 0) {
         UMD_THROW(
             error::RuntimeError,
@@ -671,7 +700,7 @@ std::pair<uint64_t, uint64_t> PCIDevice::map_hugepage_to_noc(void *hugepage, siz
 
     uint64_t physical_address = 0;
     uint64_t noc_address = 0;
-    int ret = tt_pin_pages(tt_device_handle, hugepage, size, flags, &physical_address, &noc_address);
+    int ret = tt_pin_pages(connection.get_handle(), hugepage, size, flags, &physical_address, &noc_address);
     if (ret != 0) {
         UMD_THROW(
             error::RuntimeError,
@@ -713,7 +742,7 @@ uint64_t PCIDevice::map_for_dma(void *buffer, size_t size, DeviceBufferAccess de
     }
 
     uint64_t physical_address = 0;
-    int ret = tt_pin_pages(tt_device_handle, buffer, size, flags, &physical_address, nullptr);
+    int ret = tt_pin_pages(connection.get_handle(), buffer, size, flags, &physical_address, nullptr);
     if (ret != 0) {
         UMD_THROW(
             error::RuntimeError,
@@ -745,8 +774,16 @@ void PCIDevice::unmap_for_dma(void *buffer, size_t size) {
         UMD_THROW(error::RuntimeError, "Buffer must be page-aligned with a size that is a multiple of the page size.");
     }
 
-    int ret = tt_unpin_pages(tt_device_handle, buffer, size);
+    int ret = tt_unpin_pages(connection.get_cleanup_handle(), buffer, size);
     if (ret != 0) {
+        if (!connection.is_valid()) {
+            log_warning(
+                LogUMD,
+                "Failed to retire pinned pages on quarantined PCI device {}: {}",
+                pci_device_num,
+                strerror(-ret));
+            return;
+        }
         UMD_THROW(
             error::RuntimeError,
             fmt::format(
@@ -791,8 +828,13 @@ SemVer PCIDevice::read_kernel_version() {
 std::unique_ptr<TlbHandle> PCIDevice::allocate_tlb(
     const size_t tlb_size, const TlbMapping tlb_mapping, const bool verify_config) {
     ZoneScopedC(tracy::Color::Cyan);
+    // Preserve the original typed connection failure instead of wrapping it
+    // as a resource-allocation error below.
+    connection.get_handle();
     try {
         return std::make_unique<SiliconTlbHandle>(*this, tlb_size, tlb_mapping, verify_config);
+    } catch (const error::UmdException<error::PciDeviceConnectionError> &) {
+        throw;
     } catch (const std::exception &e) {
         if (read_kmd_version() < SemVer(2, 6, 0)) {
             UMD_THROW(
@@ -815,6 +857,7 @@ std::unique_ptr<TlbHandle> PCIDevice::allocate_tlb(
 }
 
 void PCIDevice::configure_tlb(const uint32_t tlb_index, const tlb_data &tlb_config, const bool verify) {
+    connection.get_handle();
     // Get the TLB configuration for this index.
     auto tlb_configuration = get_architecture_tlbs(arch).get_configuration(tlb_index);
 
@@ -899,7 +942,9 @@ void PCIDevice::send_reset_ioctl_to_devices(
             continue;
         }
         try {
-            send_reset_ioctl(n, static_cast<uint32_t>(flags));
+            log_debug(
+                tt::LogUMD, "Attempting to reset PCI device ID {} with flags {}", n, static_cast<uint32_t>(flags));
+            detail::send_reset_ioctl(n, static_cast<uint32_t>(flags));
         } catch (error::UmdBaseException &e) {
             if (!ignore_failures) {
                 throw;
@@ -957,7 +1002,7 @@ bool PCIDevice::try_allocate_pcie_dma_buffer_no_iommu(const size_t dma_buf_size)
     void *buffer = nullptr;
     uint64_t physical_address = 0;
     int ret = tt_allocate_dma_buf(
-        tt_device_handle, 0, dma_buf_alloc_size, TT_DMA_FLAG_NONE, &buffer, &physical_address, nullptr);
+        connection.get_handle(), 0, dma_buf_alloc_size, TT_DMA_FLAG_NONE, &buffer, &physical_address, nullptr);
     if (ret != 0) {
         // Buffers allocated but not mapped can't be deallocated until the fd is
         // closed, but since this is a temporary hack we just retry with a
@@ -1049,7 +1094,7 @@ int PCIDevice::export_tlb_dmabuf(
             read_kernel_version().str()));
 
     tt_tlb_t *tlb = nullptr;
-    int ret = tt_tlb_alloc(tt_device_handle, window_size, TT_MMIO_CACHE_MODE_WC, &tlb);
+    int ret = tt_tlb_alloc(connection.get_handle(), window_size, TT_MMIO_CACHE_MODE_WC, &tlb);
     if (ret != 0) {
         UMD_THROW(
             error::RuntimeError,
@@ -1057,8 +1102,15 @@ int PCIDevice::export_tlb_dmabuf(
                 "Failed to allocate a {} byte TLB window to export as a dma-buf: {}", window_size, strerror(-ret)));
     }
 
-    // No TlbHandle owns this window, so every path below releases it explicitly. Any new exit added
-    // here must do the same, or the window leaks out of the allocation pool until the process exits.
+    // Cleanup is tied to the original handle even if a concurrent DMA failure
+    // quarantines normal access between allocation and export.
+    const auto release_tlb = [handle = connection.get_cleanup_handle()](tt_tlb_t *owned) {
+        tt_tlb_free(handle, owned);
+    };
+    std::unique_ptr<tt_tlb_t, decltype(release_tlb)> tlb_owner(tlb, release_tlb);
+
+    // The cleanup owner above releases this window on every success, error or
+    // concurrent quarantine exit without requiring ordinary connection access.
     tt_noc_addr_config_t noc_config{};
     noc_config.addr = config.local_offset;
     noc_config.x_end = static_cast<uint16_t>(config.x_end);
@@ -1070,9 +1122,8 @@ int PCIDevice::export_tlb_dmabuf(
     noc_config.ordering = static_cast<uint8_t>(config.ordering);
     noc_config.static_vc = static_cast<uint8_t>(config.static_vc);
 
-    ret = tt_tlb_map(tt_device_handle, tlb, &noc_config);
+    ret = tt_tlb_map(connection.get_handle(), tlb, &noc_config);
     if (ret != 0) {
-        tt_tlb_free(tt_device_handle, tlb);
         UMD_THROW(
             error::RuntimeError,
             fmt::format(
@@ -1084,9 +1135,8 @@ int PCIDevice::export_tlb_dmabuf(
     }
 
     int fd = -1;
-    ret = tt_tlb_export_dmabuf(tt_device_handle, tlb, offset, size, &fd);
+    ret = tt_tlb_export_dmabuf(connection.get_handle(), tlb, offset, size, &fd);
     if (ret != 0) {
-        tt_tlb_free(tt_device_handle, tlb);
         UMD_THROW(
             error::RuntimeError,
             fmt::format(
@@ -1094,8 +1144,6 @@ int PCIDevice::export_tlb_dmabuf(
     }
 
     // Released on success as well: the driver keeps the window pinned for as long as the fd is open.
-    tt_tlb_free(tt_device_handle, tlb);
-
     return fd;
 }
 
@@ -1114,7 +1162,7 @@ void PCIDevice::set_power_state(bool busy) {
         TT_POWER_FLAG_MRISC_PHY_WAKEUP | TT_POWER_FLAG_L2CPU_ENABLE | TT_POWER_FLAG_TENSIX_ENABLE;
     uint16_t flags = busy ? busy_flags : not_busy_flags;
 
-    int ret = tt_device_set_power_state(tt_device_handle, flags);
+    int ret = tt_device_set_power_state(connection.get_handle(), flags);
     if (ret != 0) {
         log_warning(LogUMD, "Setting power state failed on device {}: {}", pci_device_num, strerror(-ret));
     }

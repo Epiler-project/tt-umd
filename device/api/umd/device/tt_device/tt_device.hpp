@@ -89,6 +89,11 @@ public:
         const std::shared_ptr<SocArchDescriptor> &soc_arch_descriptor = nullptr);
 
     static std::unique_ptr<TTDevice> create(
+        std::unique_ptr<PCIDevice> pci_device,
+        bool use_safe_api = false,
+        const std::shared_ptr<SocArchDescriptor> &soc_arch_descriptor = nullptr);
+
+    static std::unique_ptr<TTDevice> create(
         std::unique_ptr<RemoteCommunication> remote_communication,
         const std::shared_ptr<SocArchDescriptor> &soc_arch_descriptor = nullptr);
 

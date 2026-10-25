@@ -5,8 +5,10 @@
 #pragma once
 
 #include <sys/types.h>
+#include <cstdint>
 
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,6 +18,32 @@
 #include "umd/device/utils/mutex_interface.hpp"
 
 namespace tt::umd {
+
+class PciDeviceConnection;
+struct PciDeviceConnectionState;
+enum class PcieResourceLockKind { Dma, MemoryBarrier, ChipInUse };
+
+// A guard retains only the original opaque driver connection, never PCIDevice
+// or its mappings. The registry owns the stable shared-memory mutex alone.
+class PcieResourceLock {
+public:
+    ~PcieResourceLock() noexcept;
+    PcieResourceLock(PcieResourceLock &&other) noexcept;
+    PcieResourceLock &operator=(PcieResourceLock &&) = delete;
+    PcieResourceLock(const PcieResourceLock &) = delete;
+    PcieResourceLock &operator=(const PcieResourceLock &) = delete;
+    void unlock();
+
+private:
+    friend class LockManager;
+    PcieResourceLock(std::shared_ptr<PciDeviceConnectionState> connection, MutexInterface &robust, uint8_t index);
+    void release();
+    std::shared_ptr<PciDeviceConnectionState> connection_;
+    MutexInterface *robust_ = nullptr;
+    uint8_t index_;
+    bool robust_held_ = false;
+    bool kmd_held_ = false;
+};
 
 enum class MutexType {
     // Used to serialize communication with the ARC.
@@ -53,9 +81,15 @@ std::string to_string(MutexType mutex_type);
 // Chip specific locks on a PCIe device are backed by a KMD resource lock, so that processes which share the device but
 // not /dev/shm still serialize against each other. Everything else - system wide locks and locks on a JTAG device - is
 // backed by RobustMutex, since a KMD resource lock exists only per local PCIe device.
+// PCIe DMA and memory barriers are connection-scoped: this registry retains
+// their RobustMutex alone; PcieResourceLock retains the caller's driver handle.
 class LockManager {
 public:
     LockManager() = delete;
+
+    static PcieResourceLock acquire_pcie_resource(PciDeviceConnection &connection, PcieResourceLockKind kind);
+    static std::optional<std::pair<pid_t, pid_t>> probe_pcie_resource(
+        PciDeviceConnection &connection, PcieResourceLockKind kind);
 
     // Mutex types that are initialized per chip (combined with device_id + device_type).
     inline static const std::vector<MutexType> CHIP_SPECIFIC_MUTEX_TYPES = {

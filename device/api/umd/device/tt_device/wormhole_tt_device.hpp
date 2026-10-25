@@ -45,6 +45,10 @@ private:
     // Builds the ARC message (with the common prefix) that requests the given clock state.
 
     friend std::unique_ptr<TTDevice> TTDevice::create(
+        std::unique_ptr<PCIDevice> pci_device,
+        bool use_safe_api,
+        const std::shared_ptr<SocArchDescriptor> &soc_arch_descriptor);
+    friend std::unique_ptr<TTDevice> TTDevice::create(
         int device_number,
         IODeviceType device_type,
         bool use_safe_api,

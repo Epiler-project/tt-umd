@@ -42,13 +42,14 @@ TEST(TestLockManager, ChipSpecificPcieLockIsHeldInBothBackends) {
     RobustMutex shm_lock(mem_barrier_lock_name(device_num));
     shm_lock.initialize();
 
-    LockManager::initialize_mutex(MutexType::MEM_BARRIER, device_num, IODeviceType::PCIe);
+    PciDeviceConnection connection(device_num, PciDeviceConnectionMode::LockOnly);
 
     {
-        auto lock = LockManager::acquire_mutex(MutexType::MEM_BARRIER, device_num, IODeviceType::PCIe);
+        auto lock = LockManager::acquire_pcie_resource(connection, PcieResourceLockKind::MemoryBarrier);
 
         EXPECT_TRUE(kmd_lock.is_locked_by_anyone()) << "KMD resource lock should be held";
         EXPECT_TRUE(shm_lock.probe_lock(std::chrono::seconds(0)).has_value()) << "Shared memory lock should be held";
+        lock.unlock();
     }
 
     EXPECT_FALSE(kmd_lock.is_locked_by_anyone()) << "KMD resource lock should have been released";
