@@ -122,6 +122,59 @@ int tt_device_get_attrs(tt_device_t* dev, tt_device_attrs_t* out_attrs) {
     return 0;
 }
 
+static int reset_lease_exchange(tt_device_t* dev, uint32_t operation, tt_reset_lease_info_t* out_info) {
+    if (dev == NULL || out_info == NULL) {
+        return -EINVAL;
+    }
+    struct tenstorrent_reset_lease request = {0};
+    request.in.argsz = sizeof(request);
+    request.in.version = TENSTORRENT_RESET_LEASE_VERSION;
+    request.in.operation = operation;
+    if (ioctl(dev->fd, TENSTORRENT_IOCTL_RESET_LEASE, &request) != 0) {
+        return -errno;
+    }
+    if (request.out.reserved[0] || request.out.reserved[1] ||
+        !(request.out.capabilities & TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE) ||
+        (request.out.capabilities & ~(TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE |
+                                      TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET)) ||
+        request.out.state > TENSTORRENT_RESET_LEASE_INVALIDATED) {
+        return -EPROTO;
+    }
+    if (request.out.state == TENSTORRENT_RESET_LEASE_NONE) {
+        if (request.out.lease_id != 0 || request.out.lease_reset_generation != 0) {
+            return -EPROTO;
+        }
+    } else if (request.out.lease_id == 0 ||
+               (request.out.state == TENSTORRENT_RESET_LEASE_HELD &&
+                request.out.lease_reset_generation != request.out.device_reset_generation)) {
+        return -EPROTO;
+    }
+    if ((operation == TENSTORRENT_RESET_LEASE_ACQUIRE && request.out.state != TENSTORRENT_RESET_LEASE_HELD) ||
+        (operation == TENSTORRENT_RESET_LEASE_RELEASE &&
+         (request.out.state != TENSTORRENT_RESET_LEASE_RELEASED ||
+          request.out.lease_reset_generation != request.out.device_reset_generation))) {
+        return -EPROTO;
+    }
+    out_info->capabilities = request.out.capabilities;
+    out_info->state = (enum tt_reset_lease_state)request.out.state;
+    out_info->lease_id = request.out.lease_id;
+    out_info->lease_reset_generation = request.out.lease_reset_generation;
+    out_info->device_reset_generation = request.out.device_reset_generation;
+    return 0;
+}
+
+int tt_device_reset_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_QUERY, out_info);
+}
+
+int tt_device_reset_lease_acquire(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_ACQUIRE, out_info);
+}
+
+int tt_device_reset_lease_release(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_RELEASE, out_info);
+}
+
 int tt_device_get_attr(tt_device_t* dev, enum tt_device_attr attr, uint64_t* out_value) {
     tt_device_attrs_t attrs = {0};
     int ret = tt_device_get_attrs(dev, &attrs);

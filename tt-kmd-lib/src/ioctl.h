@@ -32,6 +32,45 @@
 #define TENSTORRENT_IOCTL_SET_NOC_CLEANUP		_IO(TENSTORRENT_IOCTL_MAGIC, 14)
 #define TENSTORRENT_IOCTL_SET_POWER_STATE		_IO(TENSTORRENT_IOCTL_MAGIC, 15)
 #define TENSTORRENT_IOCTL_EXPORT_TLB_DMABUF	_IO(TENSTORRENT_IOCTL_MAGIC, 16)
+#define TENSTORRENT_IOCTL_RESET_LEASE		_IOWR(TENSTORRENT_IOCTL_MAGIC, 0x80, struct tenstorrent_reset_lease)
+
+/* Exclusion is bound to the original open file description (dup/fork retain
+ * it). It excludes ordinary driver traffic, but proves neither device reset
+ * nor clean firmware state. RESET is unsupported unless STRICT_RESET is set.
+ * Query remains available on a stale retained file. An invalidated lease
+ * keeps exclusion until that original file description is finally closed.
+ */
+#define TENSTORRENT_RESET_LEASE_VERSION 1
+#define TENSTORRENT_RESET_LEASE_QUERY 0
+#define TENSTORRENT_RESET_LEASE_ACQUIRE 1
+#define TENSTORRENT_RESET_LEASE_RELEASE 2
+#define TENSTORRENT_RESET_LEASE_RESET 3
+#define TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE (1U << 0)
+#define TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET (1U << 1)
+#define TENSTORRENT_RESET_LEASE_NONE 0
+#define TENSTORRENT_RESET_LEASE_HELD 1
+#define TENSTORRENT_RESET_LEASE_RELEASED 2
+#define TENSTORRENT_RESET_LEASE_INVALIDATED 3
+#define TENSTORRENT_RESET_LEASE_LOCK_INDEX 20
+
+struct tenstorrent_reset_lease_in {
+	__u32 argsz; /* sizeof(struct tenstorrent_reset_lease), exactly for v1 */
+	__u32 version;
+	__u32 operation;
+	__u32 reserved; /* Must be zero. */
+};
+struct tenstorrent_reset_lease_out {
+	__u32 capabilities;
+	__u32 state;
+	__u32 reserved[2];
+	__u64 lease_id; /* Correlation within this device allocation, not authority. */
+	__u64 lease_reset_generation;
+	__u64 device_reset_generation;
+};
+struct tenstorrent_reset_lease {
+	struct tenstorrent_reset_lease_in in;
+	struct tenstorrent_reset_lease_out out;
+};
 
 // For tenstorrent_mapping.mapping_id. These are not array indices.
 #define TENSTORRENT_MAPPING_UNUSED		0

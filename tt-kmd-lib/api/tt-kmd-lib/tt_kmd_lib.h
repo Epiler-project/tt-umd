@@ -97,6 +97,42 @@ typedef struct tt_device_attrs_t {
 } tt_device_attrs_t;
 
 /**
+ * @brief Capabilities advertised by the versioned reset lease query.
+ *
+ * These bits describe the driver protocol; they do not attest that a reset
+ * occurred or that the device is clean and ready for bootstrap.
+ */
+enum tt_reset_lease_capability {
+    TT_RESET_LEASE_CAP_EXCLUSIVE = 1U << 0,
+    TT_RESET_LEASE_CAP_STRICT_RESET = 1U << 1,
+};
+
+/**
+ * @brief Reset lease state belonging to the original open file description.
+ */
+enum tt_reset_lease_state {
+    TT_RESET_LEASE_NONE = 0,
+    TT_RESET_LEASE_HELD = 1,
+    TT_RESET_LEASE_RELEASED = 2,
+    TT_RESET_LEASE_INVALIDATED = 3,
+};
+
+/**
+ * @brief Validated lease query result for the retained device handle.
+ *
+ * The lease ID and generations correlate observations within one device
+ * allocation. They cannot transfer ownership to another handle. An invalidated
+ * lease retains exclusion until its original open file description is closed.
+ */
+typedef struct tt_reset_lease_info_t {
+    uint32_t capabilities; /**< Bitmask of enum tt_reset_lease_capability. */
+    enum tt_reset_lease_state state;
+    uint64_t lease_id;
+    uint64_t lease_reset_generation;
+    uint64_t device_reset_generation;
+} tt_reset_lease_info_t;
+
+/**
  * @brief Queryable attributes of the Tenstorrent driver.
  */
 enum tt_driver_attr {
@@ -174,6 +210,66 @@ int tt_device_get_attr(tt_device_t* dev, enum tt_device_attr attr, uint64_t* out
  * @return 0 on success, error code on failure
  */
 int tt_device_get_attrs(tt_device_t* dev, tt_device_attrs_t* out_attrs);
+
+/**
+ * @brief Query the reset lease on the original retained device handle.
+ *
+ * Issues one versioned query without reopening the device, acquiring a lease,
+ * resetting the device, or falling back to a legacy reset ioctl. The query is
+ * also available for an invalidated lease on a stale retained handle. A success
+ * reports validated driver state; it does not authorize reset or attest clean
+ * state or bootstrap completion.
+ *
+ * @param dev Retained device handle
+ * @param out_info Populated only on success; unchanged on any failure
+ * @return 0 on success, -EINVAL for null arguments, -EPROTO for an invalid
+ *         versioned response, or the negative ioctl errno (including -ENOTTY
+ *         when the driver does not support the query)
+ */
+int tt_device_reset_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_info);
+
+/**
+ * @brief Acquire exclusive driver admission on the original retained handle.
+ *
+ * The driver admits only the original O_APPEND open file description that
+ * already owns CHIP_IN_USE and is the device's sole open owner, with no mapped,
+ * DMA, pinned, peer, user TLB, NoC-cleanup, or power resources. This call does
+ * not acquire CHIP_IN_USE, reopen, retry, reset, or close the handle. Successful
+ * exclusion alone does not prove a reset, clean state, or bootstrap.
+ *
+ * A successful ioctl followed by an invalid response may already have acquired
+ * the lease. On error, unchanged out_info does not mean the lease is unheld.
+ * Keep the original handle and query it to resolve driver state, or close that
+ * handle after retiring every user of it. Do not reopen or retry blindly.
+ *
+ * @param dev Original retained lock-only handle owning CHIP_IN_USE
+ * @param out_info Populated with TT_RESET_LEASE_HELD only on success;
+ *                 unchanged on failure, even when driver ownership is unknown
+ * @return 0 on success, -EINVAL for null arguments, -EPROTO for an invalid
+ *         versioned response, or the negative ioctl errno
+ */
+int tt_device_reset_lease_acquire(tt_device_t* dev, tt_reset_lease_info_t* out_info);
+
+/**
+ * @brief Release reset-lease exclusion on the original retained handle.
+ *
+ * Releases only the exclusive reset lease, keeping the handle and CHIP_IN_USE
+ * ownership intact. Release the reset lease before releasing CHIP_IN_USE. An
+ * invalidated lease cannot be released this way; its original open file
+ * description must be closed. This call never retries, reopens, or closes it.
+ *
+ * A successful ioctl followed by an invalid response may already have released
+ * exclusion. On error, unchanged out_info does not prove continued ownership;
+ * use tt_device_reset_lease_query on the original retained handle or close it
+ * after retiring its users. No error path restores or transfers the lease.
+ *
+ * @param dev Original retained handle owning the reset lease
+ * @param out_info Populated with TT_RESET_LEASE_RELEASED only on success;
+ *                 unchanged on failure, even when driver ownership is unknown
+ * @return 0 on success, -EINVAL for null arguments, -EPROTO for an invalid
+ *         versioned response, or the negative ioctl errno
+ */
+int tt_device_reset_lease_release(tt_device_t* dev, tt_reset_lease_info_t* out_info);
 
 /**
  * @brief Query driver attributes.
