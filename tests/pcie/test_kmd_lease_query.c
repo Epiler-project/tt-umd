@@ -289,10 +289,12 @@ int main(void) {
     mutations(device);
     unsigned prior_calls = calls;
     tt_reset_lease_info_t output;
+    memset(&output, 0x5a, sizeof(output));
+    const tt_reset_lease_info_t before = output;
     expect(
         tt_device_reset_lease_query(NULL, &output) == -EINVAL && tt_device_reset_lease_query(device, NULL) == -EINVAL &&
-            calls == prior_calls,
-        "invalid host arguments cannot reach a syscall");
+            calls == prior_calls && memcmp(&output, &before, sizeof(output)) == 0,
+        "invalid host arguments cannot reach a syscall or change output");
     tt_device_t *second = NULL;
     expect(tt_device_open("/dev/tenstorrent/42", &second, O_APPEND) == 0, "second test owner opens independently");
     if (second == NULL) {

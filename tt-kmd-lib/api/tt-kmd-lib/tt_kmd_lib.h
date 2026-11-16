@@ -727,17 +727,17 @@ enum tt_power_flags {
 int tt_device_set_power_state(tt_device_t* dev, uint16_t power_flags);
 
 /**
- * @brief Issue a reset command without consuming the device handle.
+ * @brief Legacy reset entry point; currently refuses without side effects.
  *
- * The caller retains ownership on every return path and must eventually call
- * tt_device_close(). A successful result reports the existing reset ioctl's
- * outcome only; a reset may invalidate the handle for subsequent driver I/O.
+ * Reset requires a lease operation with a verifiable completion contract.
+ * This legacy entry point does not issue RESET_DEVICE, query or acquire a
+ * lease, or consume the retained device handle. Callers must use an explicit
+ * recovery API once the driver and UMD publish that contract.
  *
  * @param dev Device handle; must not be NULL
  * @param reset_flags Reset flags.
- * @return 0 on a complete successful response; -EPROTO for a short response,
- *         -EIO for a reported reset failure, -ENODEV for NULL dev, or the
- *         negative syscall errno. No return path closes or frees dev.
+ * @return -EOPNOTSUPP for non-NULL handles or -ENODEV for NULL dev. No return
+ *         path issues an ioctl or closes/frees dev.
  */
 int tt_device_reset(tt_device_t* dev, uint32_t reset_flags);
 

@@ -798,27 +798,11 @@ int tt_device_set_power_state(tt_device_t* dev, uint16_t power_flags) {
 }
 
 int tt_device_reset(tt_device_t* dev, uint32_t reset_flags) {
-    struct tenstorrent_reset_device reset_info = {0};
-
     if (dev == NULL) {
         return -ENODEV;
     }
-
-    reset_info.in.output_size_bytes = sizeof(reset_info.out);
-    reset_info.in.flags = reset_flags;
-
-    reset_info.out.output_size_bytes = 0;
-    reset_info.out.result = 0;
-
-    if (ioctl(dev->fd, TENSTORRENT_IOCTL_RESET_DEVICE, &reset_info) != 0) {
-        return -errno;
-    }
-
-    if (reset_info.out.output_size_bytes < sizeof(reset_info.out)) {
-        return -EPROTO;
-    }
-
-    return reset_info.out.result == 0 ? 0 : -EIO;
+    (void)reset_flags;
+    return -EOPNOTSUPP;
 }
 
 /* All three lock operations issue the same ioctl, differing only in the flag they pass and in how
