@@ -122,7 +122,8 @@ uint32_t BlackholeArcMessageQueue::send_message(
     std::vector<uint32_t>& return_values,
     const std::vector<uint32_t>& args,
     const std::chrono::milliseconds timeout_ms,
-    const NocId noc_id) {
+    const NocId noc_id,
+    uint8_t* handler_status) {
     if (args.size() > 7) {
         UMD_THROW(
             error::RuntimeError,
@@ -143,6 +144,9 @@ uint32_t BlackholeArcMessageQueue::send_message(
 
     uint32_t status = response[0] & 0xFF;
 
+    if (handler_status != nullptr) {
+        *handler_status = static_cast<uint8_t>(status);
+    }
     return_values.assign(response.begin() + 1, response.end());
 
     // Response is packed in high 16 bits of the message.

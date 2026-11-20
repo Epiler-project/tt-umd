@@ -163,8 +163,11 @@ void LocalChip::start_device(uint32_t dram_membar_subchannel) {
     // TODO: acquire mutex should live in Chip class. Currently we don't have unique id for all chips.
     // The lock here should suffice since we have to open Local chip to have Remote chips initialized.
     if (tt_device_->get_communication_device_type() == IODeviceType::PCIe) {
-        chip_started_pcie_lock_.emplace(LockManager::acquire_pcie_resource(
-            tt_device_->get_pci_device()->get_connection(), PcieResourceLockKind::ChipInUse));
+        auto& connection = tt_device_->get_pci_device()->get_connection();
+        if (!connection.has_exclusive_execution()) {
+            chip_started_pcie_lock_.emplace(
+                LockManager::acquire_pcie_resource(connection, PcieResourceLockKind::ChipInUse));
+        }
     } else {
         chip_started_robust_lock_.emplace(LockManager::acquire_mutex(
             MutexType::CHIP_IN_USE,

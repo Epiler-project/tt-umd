@@ -27,6 +27,9 @@ class BlackholeTTDevice : public TTDevice {
 public:
     ~BlackholeTTDevice() override;
 
+    uint64_t reset_tensix_tiles(CoreCoord physical_worker) override;
+    bool has_tensix_reset(CoreCoord physical_worker, uint64_t epoch) const override;
+
     void configure_iatu_region(size_t region, uint64_t target, size_t region_size) override;
 
     uint32_t get_clock() override;
@@ -45,6 +48,9 @@ protected:
     // Number of retrain attempts is chosen based on syseng team testing.
 private:
     const ArchitectureRegisters registers_ = get_architecture_registers(tt::ARCH::BLACKHOLE);
+
+    struct ResetController;
+    std::unique_ptr<ResetController> reset_controller_;
 
     int get_pcie_x_coordinate();
 

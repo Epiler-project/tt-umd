@@ -96,6 +96,9 @@ typedef struct tt_device_attrs_t {
     uint64_t num_4g_tlbs;             /**< TT_DEVICE_ATTR_NUM_4G_TLBS */
 } tt_device_attrs_t;
 
+/** KMD resource index required for exclusive admission on the same file. */
+#define TT_RESET_LEASE_LOCK_INDEX 20
+
 /**
  * @brief Capabilities advertised by the versioned reset lease query.
  *
@@ -105,6 +108,7 @@ typedef struct tt_device_attrs_t {
 enum tt_reset_lease_capability {
     TT_RESET_LEASE_CAP_EXCLUSIVE = 1U << 0,
     TT_RESET_LEASE_CAP_STRICT_RESET = 1U << 1,
+    TT_RESET_LEASE_CAP_EXECUTION = 1U << 2,
 };
 
 /**
@@ -115,6 +119,7 @@ enum tt_reset_lease_state {
     TT_RESET_LEASE_HELD = 1,
     TT_RESET_LEASE_RELEASED = 2,
     TT_RESET_LEASE_INVALIDATED = 3,
+    TT_RESET_LEASE_EXECUTING = 4,
 };
 
 /**
@@ -249,6 +254,17 @@ int tt_device_reset_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_inf
  *         versioned response, or the negative ioctl errno
  */
 int tt_device_reset_lease_acquire(tt_device_t* dev, tt_reset_lease_info_t* out_info);
+
+/** Query execution lease state using the v2 protocol on the original device handle. */
+int tt_device_execution_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_info);
+
+/**
+ * Enable ordinary MMIO and device operations under the held exclusive lease.
+ * The same open file description keeps exclusion until final close. The driver
+ * may already have performed the transition if decoding the response fails.
+ * Query on the same handle or retire it. This transition does not reset hardware.
+ */
+int tt_device_reset_lease_begin_execution(tt_device_t* dev, tt_reset_lease_info_t* out_info);
 
 /**
  * @brief Release reset-lease exclusion on the original retained handle.

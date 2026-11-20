@@ -148,6 +148,24 @@ TEST_P(BlackholeArcMessageQueueTest, SendMessagePushesRequestAndReturnsResponse)
     EXPECT_EQ(memory_[word_address(RESPONSE_RPTR_OFFSET)], 1u);
 }
 
+TEST_P(BlackholeArcMessageQueueTest, PreservesFirmwareHandlerStatusAlongsideTheLegacyPayload) {
+    BlackholeArcApb apb(&protocol_, &pcie_, nullptr);
+    auto queue = make_queue(apb);
+    // Blackhole v19.5 places a failing SMC handler's status in response word 0, bits 7:0.
+    publish_response(1, 0, {});
+    std::vector<uint32_t> values;
+    uint8_t status = 0;
+    const uint32_t payload = queue.send_message(
+        static_cast<ArcMessageType>(blackhole::ArcMessageType::FORCE_AICLK),
+        values,
+        {250},
+        timeout::ARC_MESSAGE_TIMEOUT,
+        noc(),
+        &status);
+    EXPECT_EQ(payload, 0u);
+    EXPECT_EQ(status, 1u);
+}
+
 TEST_P(BlackholeArcMessageQueueTest, SendMessageTriggersFirmwareInterrupt) {
     BlackholeArcApb apb(&protocol_, &pcie_, /*jtag_interface=*/nullptr);
     auto queue = make_queue(apb);

@@ -122,22 +122,28 @@ int tt_device_get_attrs(tt_device_t* dev, tt_device_attrs_t* out_attrs) {
     return 0;
 }
 
-static int reset_lease_exchange(tt_device_t* dev, uint32_t operation, tt_reset_lease_info_t* out_info) {
+static int reset_lease_exchange(tt_device_t* dev, uint32_t version, uint32_t operation, tt_reset_lease_info_t* out_info) {
     if (dev == NULL || out_info == NULL) {
         return -EINVAL;
     }
     struct tenstorrent_reset_lease request = {0};
     request.in.argsz = sizeof(request);
-    request.in.version = TENSTORRENT_RESET_LEASE_VERSION;
+    request.in.version = version;
     request.in.operation = operation;
     if (ioctl(dev->fd, TENSTORRENT_IOCTL_RESET_LEASE, &request) != 0) {
         return -errno;
     }
+    uint32_t allowed_caps = TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE | TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET;
+    uint32_t last_state = TENSTORRENT_RESET_LEASE_INVALIDATED;
+    if (version == TENSTORRENT_RESET_LEASE_EXECUTION_VERSION) {
+        allowed_caps |= TENSTORRENT_RESET_LEASE_CAP_EXECUTION;
+        last_state = TENSTORRENT_RESET_LEASE_EXECUTING;
+    }
     if (request.out.reserved[0] || request.out.reserved[1] ||
         !(request.out.capabilities & TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE) ||
-        (request.out.capabilities & ~(TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE |
-                                      TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET)) ||
-        request.out.state > TENSTORRENT_RESET_LEASE_INVALIDATED) {
+        (request.out.capabilities & ~allowed_caps) || request.out.state > last_state ||
+        (request.out.state == TENSTORRENT_RESET_LEASE_EXECUTING &&
+         !(request.out.capabilities & TENSTORRENT_RESET_LEASE_CAP_EXECUTION))) {
         return -EPROTO;
     }
     if (request.out.state == TENSTORRENT_RESET_LEASE_NONE) {
@@ -145,11 +151,12 @@ static int reset_lease_exchange(tt_device_t* dev, uint32_t operation, tt_reset_l
             return -EPROTO;
         }
     } else if (request.out.lease_id == 0 ||
-               (request.out.state == TENSTORRENT_RESET_LEASE_HELD &&
+               ((request.out.state == TENSTORRENT_RESET_LEASE_HELD || request.out.state == TENSTORRENT_RESET_LEASE_EXECUTING) &&
                 request.out.lease_reset_generation != request.out.device_reset_generation)) {
         return -EPROTO;
     }
     if ((operation == TENSTORRENT_RESET_LEASE_ACQUIRE && request.out.state != TENSTORRENT_RESET_LEASE_HELD) ||
+        (operation == TENSTORRENT_RESET_LEASE_BEGIN_EXECUTION && request.out.state != TENSTORRENT_RESET_LEASE_EXECUTING) ||
         (operation == TENSTORRENT_RESET_LEASE_RELEASE &&
          (request.out.state != TENSTORRENT_RESET_LEASE_RELEASED ||
           request.out.lease_reset_generation != request.out.device_reset_generation))) {
@@ -164,15 +171,23 @@ static int reset_lease_exchange(tt_device_t* dev, uint32_t operation, tt_reset_l
 }
 
 int tt_device_reset_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
-    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_QUERY, out_info);
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_VERSION, TENSTORRENT_RESET_LEASE_QUERY, out_info);
 }
 
 int tt_device_reset_lease_acquire(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
-    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_ACQUIRE, out_info);
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_VERSION, TENSTORRENT_RESET_LEASE_ACQUIRE, out_info);
 }
 
 int tt_device_reset_lease_release(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
-    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_RELEASE, out_info);
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_VERSION, TENSTORRENT_RESET_LEASE_RELEASE, out_info);
+}
+
+int tt_device_execution_lease_query(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_EXECUTION_VERSION, TENSTORRENT_RESET_LEASE_QUERY, out_info);
+}
+
+int tt_device_reset_lease_begin_execution(tt_device_t* dev, tt_reset_lease_info_t* out_info) {
+    return reset_lease_exchange(dev, TENSTORRENT_RESET_LEASE_EXECUTION_VERSION, TENSTORRENT_RESET_LEASE_BEGIN_EXECUTION, out_info);
 }
 
 int tt_device_get_attr(tt_device_t* dev, enum tt_device_attr attr, uint64_t* out_value) {

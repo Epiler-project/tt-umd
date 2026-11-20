@@ -137,7 +137,9 @@ DeviceCommandResult BlackholeDeviceFirmware::send_device_command(
                     : ArcLock{LockManager::acquire_mutex(MutexType::ARC_MSG, device_id_, IODeviceType::JTAG)};
 
     std::vector<uint32_t> return_values;
-    uint32_t exit_code = arc_msg_queue_->send_message((ArcMessageType)msg_code, return_values, args, timeout, noc_id);
+    uint8_t handler_status;
+    uint32_t exit_code = arc_msg_queue_->send_message(
+        (ArcMessageType)msg_code, return_values, args, timeout, noc_id, &handler_status);
     std::visit([](auto& guard) { guard.unlock(); }, lock);
 
     log_debug(
@@ -147,7 +149,7 @@ DeviceCommandResult BlackholeDeviceFirmware::send_device_command(
         exit_code,
         fmt::join(return_values, ", "));
 
-    return DeviceCommandResult{exit_code, std::move(return_values)};
+    return DeviceCommandResult{exit_code, std::move(return_values), handler_status};
 }
 
 void BlackholeDeviceFirmware::set_power_state(PowerState state, NocId noc_id) {

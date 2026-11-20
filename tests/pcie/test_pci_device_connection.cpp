@@ -78,6 +78,8 @@ struct IoState {
     unsigned deviceMmapAttempts = 0;
     unsigned deviceMappings = 0;
     unsigned deviceMunmaps = 0;
+    std::vector<uint32_t> leaseOperations;
+    uint64_t executionLeaseId = 31;
     unsigned deviceInfoQueries = 0;
     unsigned driverInfoQueries = 0;
     unsigned barQueries = 0;
@@ -496,6 +498,22 @@ TEST_F(PciDeviceDiscoveryTest, AcquisitionRetainsOnlyTheSelectedDeviceAfterMetad
         EXPECT_TRUE(io.isClosed(fd));
 }
 
+TEST_F(PciDeviceDiscoveryTest, ExclusiveExecutionRequiresExactlyTheRequestedPciFunction) {
+    setenv("TT_VISIBLE_DEVICES", "0000:01:02.0", 1);
+    tt::umd::TopologyDiscoveryOptions options;
+    options.discover_remote_devices = false;
+    options.exclusive_execution_bdf = "0000:02:02.0";
+    EXPECT_THROW(TopologyDiscoveryAccess::create_topology_discovery(options), std::exception);
+    EXPECT_TRUE(io.leaseOperations.empty());
+    EXPECT_TRUE(io.mapRequests.empty());
+
+    options.exclusive_execution_bdf = "0000:01:02.0";
+    auto discovery = TopologyDiscoveryAccess::create_topology_discovery(options);
+    ASSERT_NE(discovery, nullptr);
+    EXPECT_NE(std::find(io.leaseOperations.begin(), io.leaseOperations.end(), TENSTORRENT_RESET_LEASE_BEGIN_EXECUTION),
+              io.leaseOperations.end());
+}
+
 TEST_F(PciDeviceDiscoveryTest, EnumeratesSysfsIdentityWithoutDeviceOpens) {
     const auto devices = tt::umd::PCIDevice::enumerate_devices_info();
     ASSERT_EQ(devices.size(), 2u);
@@ -646,6 +664,53 @@ TEST_F(PciDeviceConnectionTest, RetainedConnectionTransfersToDeviceWithoutReopen
     expectBarMappings();
     expectOneConnectionForEveryDriverOperation();
     expectMappingsReleasedBeforeClose();
+}
+
+TEST_F(PciDeviceConnectionTest, ExclusiveExecutionMovesTheOwnerFromAdmissionThroughBarCleanup) {
+    {
+        tt::umd::PciDeviceConnection connection(42, tt::umd::PciDeviceConnectionMode::ExclusiveExecution);
+        ASSERT_TRUE(connection.has_exclusive_execution());
+        auto *owner = connection.get_handle();
+        tt::umd::PCIDevice device(std::move(connection));
+        EXPECT_FALSE(connection.has_exclusive_execution());
+        EXPECT_EQ(device.get_tt_device_handle(), owner);
+        EXPECT_TRUE(device.get_connection().has_exclusive_execution());
+    }
+    EXPECT_EQ(io.leaseOperations, (std::vector<uint32_t>{TENSTORRENT_RESET_LEASE_ACQUIRE,
+                                                        TENSTORRENT_RESET_LEASE_BEGIN_EXECUTION,
+                                                        TENSTORRENT_RESET_LEASE_QUERY,
+                                                        TENSTORRENT_RESET_LEASE_QUERY,
+                                                        TENSTORRENT_RESET_LEASE_QUERY}));
+    expectOneConnectionForEveryDriverOperation();
+    expectMappingsReleasedBeforeClose();
+}
+
+TEST_F(PciDeviceConnectionTest, ExclusiveExecutionRefusesChangedOwnerBeforeAnyBarMapping) {
+    io.executionLeaseId++;
+    EXPECT_THROW((tt::umd::PciDeviceConnection(42, tt::umd::PciDeviceConnectionMode::ExclusiveExecution)),
+                 std::exception);
+    EXPECT_EQ(io.deviceCloses, 1u);
+    EXPECT_EQ(io.deviceMmapAttempts, 0u);
+    EXPECT_EQ(io.deviceInfoQueries, 0u);
+}
+
+TEST_F(PciDeviceConnectionTest, ExclusiveExecutionQuarantinesLostOwnershipOnTheRetainedConnection) {
+    tt::umd::PciDeviceConnection connection(42, tt::umd::PciDeviceConnectionMode::ExclusiveExecution);
+    io.executionLeaseId++;
+    EXPECT_THROW(connection.has_exclusive_execution(), tt::umd::error::UmdException<tt::umd::error::PciDeviceConnectionError>);
+    EXPECT_FALSE(connection.is_valid());
+    EXPECT_THROW(connection.get_handle(), tt::umd::error::UmdException<tt::umd::error::PciDeviceConnectionError>);
+    EXPECT_EQ(io.deviceOpens, 1u);
+    EXPECT_EQ(io.deviceMmapAttempts, 0u);
+}
+
+TEST_F(PciDeviceConnectionTest, ExclusiveExecutionDoesNotReopenOnAnUnsupportedDriver) {
+    io.failIoctlRequest = TENSTORRENT_IOCTL_RESET_LEASE;
+    EXPECT_THROW((tt::umd::PciDeviceConnection(42, tt::umd::PciDeviceConnectionMode::ExclusiveExecution)),
+                 std::exception);
+    EXPECT_EQ(io.deviceOpens, 1u);
+    EXPECT_EQ(io.deviceCloses, 1u);
+    EXPECT_EQ(io.deviceMmapAttempts, 0u);
 }
 
 TEST_F(PciDeviceConnectionTest, LocalChipConstructorFailureReleasesSysmemBeforeItsDevice) {
@@ -1033,6 +1098,28 @@ extern "C" __attribute__((visibility("default"))) int ioctl(int fd, unsigned lon
         return -1;
     }
     switch (request) {
+    case TENSTORRENT_IOCTL_LOCK_CTL: {
+        auto *ctl = static_cast<tenstorrent_lock_ctl *>(argument);
+        if (ctl->in.index != TENSTORRENT_RESET_LEASE_LOCK_INDEX || ctl->in.flags != TENSTORRENT_LOCK_CTL_ACQUIRE)
+            return -1;
+        ctl->out.value = 1;
+        return 0;
+    }
+    case TENSTORRENT_IOCTL_RESET_LEASE: {
+        auto *lease = static_cast<tenstorrent_reset_lease *>(argument);
+        io.leaseOperations.push_back(lease->in.operation);
+        auto& out = lease->out;
+        out.capabilities = TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE;
+        out.state = TENSTORRENT_RESET_LEASE_HELD;
+        out.lease_id = 31;
+        out.lease_reset_generation = out.device_reset_generation = 7;
+        if (lease->in.version == TENSTORRENT_RESET_LEASE_EXECUTION_VERSION) {
+            out.capabilities |= TENSTORRENT_RESET_LEASE_CAP_EXECUTION;
+            out.state = TENSTORRENT_RESET_LEASE_EXECUTING;
+            out.lease_id = io.executionLeaseId;
+        }
+        return 0;
+    }
     case TENSTORRENT_IOCTL_GET_DEVICE_INFO:
         ++io.deviceInfoQueries;
         fillDeviceInfo(static_cast<tenstorrent_get_device_info *>(argument), fd);

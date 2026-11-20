@@ -445,6 +445,11 @@ public:
      */
     uint32_t get_risc_reset_state(CoreCoord core);
 
+    // Reset all Tensix tiles before worker firmware boot. The returned epoch covers only the
+    // observed NOC0 Tensix and the exclusive execution connection retained by this device.
+    virtual uint64_t reset_tensix_tiles(CoreCoord physical_worker);
+    virtual bool has_tensix_reset(CoreCoord physical_worker, uint64_t epoch) const;
+
     /**
      * Set the soft reset signal for the given riscs.
      *

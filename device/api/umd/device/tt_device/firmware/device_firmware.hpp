@@ -25,6 +25,8 @@ namespace tt::umd {
 struct DeviceCommandResult {
     uint32_t exit_code = 0;
     std::vector<uint32_t> return_values;
+    // Blackhole SMC places its handler status in bits 7:0, separately from the legacy high-word result.
+    uint8_t handler_status = 0;
 };
 
 /**

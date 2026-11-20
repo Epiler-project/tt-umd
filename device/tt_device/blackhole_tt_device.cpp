@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 #include <sys/mman.h>  // for MAP_FAILED
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <optional>
@@ -17,6 +18,7 @@
 
 #include "noc_access.hpp"
 #include "tracy.hpp"
+#include "tt_device/blackhole_tensix_reset.hpp"
 #include "umd/device/arc/arc_telemetry_reader.hpp"
 #include "umd/device/arch/architecture_implementation.hpp"
 #include "umd/device/arch/architecture_registers.hpp"
@@ -41,7 +43,78 @@
 
 namespace tt::umd {
 
-BlackholeTTDevice::BlackholeTTDevice(std::unique_ptr<TTDeviceModel> model) : TTDevice(std::move(model)) {}
+// The controller and its PCIe connection live exactly as long as this TTDevice.
+struct BlackholeTTDevice::ResetController {
+    explicit ResetController(BlackholeTTDevice& device) : device(device), reset(*this) {}
+
+    bool has_exclusive_execution() const {
+        auto* pci = device.get_pci_device();
+        return pci != nullptr && pci->get_connection().has_exclusive_execution();
+    }
+
+    FirmwareBundleVersion firmware_version() const {
+        return device.get_firmware_info_provider()->get_firmware_version(NocId::NOC0);
+    }
+
+    void check_worker(CoreCoord worker) const {
+        const auto& soc = device.get_soc_descriptor();
+        UMD_ASSERT(soc.noc_translation_enabled, error::RuntimeError, "Tensix reset requires NoC translation.");
+        const auto workers = soc.get_cores(CoreType::TENSIX, CoordSystem::NOC0);
+        UMD_ASSERT(
+            std::find(workers.begin(), workers.end(), worker) != workers.end(),
+            error::RuntimeError,
+            "Tensix reset requires an active physical NOC0 Tensix worker.");
+    }
+
+    void power_up() { device.set_power_state(PowerState::BUSY, NocId::NOC0); }
+
+    uint32_t read_marker(CoreCoord worker) const {
+        uint32_t value = 0;
+        device.read_from_device_reg(&value, worker, marker_addr, sizeof(value), NocId::NOC0);
+        return value;
+    }
+
+    void write_marker(CoreCoord worker, uint32_t value) {
+        device.write_to_device_reg(&value, worker, marker_addr, sizeof(value), NocId::NOC0);
+    }
+
+    DeviceCommandResult send(blackhole::ArcMessageType cmd, uint32_t arg) {
+        return device.get_device_firmware()->send_device_command(
+            static_cast<uint32_t>(cmd), {arg}, timeout::ARC_MESSAGE_TIMEOUT, NocId::NOC0);
+    }
+
+    void write_risc_bank(uint32_t bank, uint32_t value) {
+        const uint32_t offset = blackhole::ARC_RESET_UNIT_OFFSET + 0x40 + bank * sizeof(value);
+        device.write_to_arc_apb(&value, offset, sizeof(value));
+    }
+
+    void hold_riscs() {
+        constexpr uint32_t soft_reset = 0x47800;
+        device.noc_multicast_write(&soft_reset, sizeof(soft_reset), blackhole::TENSIX_SOFT_RESET_ADDR, NocId::NOC1);
+        // Verify delivery to every active tile before releasing the ASIC RISC banks. The NoC
+        // multicast and these reads use the same strictly ordered PCIe window on NoC1.
+        for (const CoreCoord core : device.get_soc_descriptor().get_cores(CoreType::TENSIX, CoordSystem::NOC0)) {
+            uint32_t observed = 0;
+            device.read_from_device_reg(
+                &observed, core, blackhole::TENSIX_SOFT_RESET_ADDR, sizeof(observed), NocId::NOC1);
+            UMD_ASSERT(
+                (observed & soft_reset) == soft_reset, error::RuntimeError, "Tensix RISCs did not enter soft reset.");
+        }
+    }
+
+    static constexpr uint32_t marker_addr = 0xffb120b8;  // ETH_RISC_PREFECTH_CTRL, v19.5.0 SMC test.
+    BlackholeTTDevice& device;
+    blackhole::TensixReset<ResetController> reset;
+};
+
+BlackholeTTDevice::BlackholeTTDevice(std::unique_ptr<TTDeviceModel> model) :
+    TTDevice(std::move(model)), reset_controller_(std::make_unique<ResetController>(*this)) {}
+
+uint64_t BlackholeTTDevice::reset_tensix_tiles(CoreCoord worker) { return reset_controller_->reset.run(worker); }
+
+bool BlackholeTTDevice::has_tensix_reset(CoreCoord worker, uint64_t epoch) const {
+    return reset_controller_->reset.matches(worker, epoch);
+}
 
 BlackholeTTDevice::~BlackholeTTDevice() {
     // Turn off iATU for the regions we programmed.  This won't happen if the

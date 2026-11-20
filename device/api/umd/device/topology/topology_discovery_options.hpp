@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <optional>
+#include <string>
+
 namespace tt::umd {
 /**
  * @brief Configuration options for controlling the behavior of the topology discovery process.
@@ -95,5 +98,8 @@ struct TopologyDiscoveryOptions {
      * Defaults to false.
      */
     bool use_safe_api = false;
+
+    // Select one already-visible MMIO device for an exclusive execution lease.
+    std::optional<std::string> exclusive_execution_bdf;
 };
 }  // namespace tt::umd

@@ -28,6 +28,7 @@ enum class ArcMessageType : uint8_t {
     READ_VM = 0x1D,
     I2C_MESSAGE = 0x1E,
     EFUSE_BURN_BITS = 0x1F,
+    REINIT_TENSIX = 0x20,
     SET_TDP_LIMIT = 0x22,  // In CMFW since 19.8.0. arg0: limit [W], arg1: bit 0 = restore default
     FORCE_AICLK = 0x33,
     FORCE_VDD = 0x39,
@@ -42,6 +43,7 @@ enum class ArcMessageType : uint8_t {
     ASIC_STATE1 = 0xA1,
     ASIC_STATE3 = 0xA3,
     ASIC_STATE5 = 0xA5,
+    TOGGLE_TENSIX_RESET = 0xAF,
     TOGGLE_GDDR_RESET = 0xB6,
     SET_LAST_SERIAL = 0xBE,
     EFUSE_BURN = 0xBF,

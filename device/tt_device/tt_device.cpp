@@ -562,6 +562,12 @@ void TTDevice::advance_device_execution() {
     }
 }
 
+uint64_t TTDevice::reset_tensix_tiles(CoreCoord) {
+    UMD_THROW(error::RuntimeError, "A witnessed Tensix reset is unsupported on this device.");
+}
+
+bool TTDevice::has_tensix_reset(CoreCoord, uint64_t) const { return false; }
+
 uint32_t TTDevice::get_risc_reset_state(CoreCoord core) {
     uint32_t tensix_risc_state;
     read_from_device_reg(

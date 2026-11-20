@@ -32,7 +32,11 @@ _Static_assert(
 extern int tt_device_reset_lease_acquire(tt_device_t *, tt_reset_lease_info_t *) __attribute__((weak));
 extern int tt_device_reset_lease_release(tt_device_t *, tt_reset_lease_info_t *) __attribute__((weak));
 
+extern int tt_device_reset_lease_begin_execution(tt_device_t *, tt_reset_lease_info_t *) __attribute__((weak));
+extern int tt_device_execution_lease_query(tt_device_t *, tt_reset_lease_info_t *) __attribute__((weak));
+
 static unsigned checks, failures, opens, closes, calls, unexpected;
+static uint32_t expected_version = TENSTORRENT_RESET_LEASE_VERSION;
 static int next_fd = 73, expected_fd, kernel_error;
 static uint32_t expected_operation = TENSTORRENT_RESET_LEASE_QUERY;
 static bool closed[4];
@@ -86,7 +90,7 @@ int ioctl(int fd, unsigned long command, ...) {
     struct tenstorrent_reset_lease *request = va_arg(args, struct tenstorrent_reset_lease *);
     va_end(args);
     expect(
-        request->in.argsz == sizeof(*request) && request->in.version == TENSTORRENT_RESET_LEASE_VERSION &&
+        request->in.argsz == sizeof(*request) && request->in.version == expected_version &&
             request->in.operation == expected_operation && !request->in.reserved,
         "lease call sends the exact versioned ABI and requested operation");
     const struct tenstorrent_reset_lease_out empty = {0};
@@ -218,6 +222,41 @@ static void mutations(tt_device_t *device) {
     }
 }
 
+_Static_assert(TT_RESET_LEASE_LOCK_INDEX == TENSTORRENT_RESET_LEASE_LOCK_INDEX &&
+               TT_RESET_LEASE_CAP_EXECUTION == TENSTORRENT_RESET_LEASE_CAP_EXECUTION &&
+               TT_RESET_LEASE_EXECUTING == TENSTORRENT_RESET_LEASE_EXECUTING,
+               "exclusive execution state and reservation lock match the driver ABI");
+
+static void execution_lease(tt_device_t *device) {
+    expect(tt_device_reset_lease_begin_execution && tt_device_execution_lease_query,
+           "execution lease operations are available on the retained file");
+    if (!tt_device_reset_lease_begin_execution || !tt_device_execution_lease_query)
+        return;
+
+    expected_version = TENSTORRENT_RESET_LEASE_EXECUTION_VERSION;
+    const LeaseCall operations[] = {tt_device_execution_lease_query, tt_device_reset_lease_begin_execution};
+    for (unsigned op = 0; op < 2; ++op) {
+        expected_operation = op == 0 ? TENSTORRENT_RESET_LEASE_QUERY : TENSTORRENT_RESET_LEASE_BEGIN_EXECUTION;
+        response = (struct tenstorrent_reset_lease_out){
+            .capabilities = TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE | TENSTORRENT_RESET_LEASE_CAP_EXECUTION,
+            .state = TENSTORRENT_RESET_LEASE_EXECUTING, .lease_id = 41, .lease_reset_generation = 9, .device_reset_generation = 9};
+        exchange(device, operations[op], 0, "accepts an execution lease without a strict reset capability");
+        response.capabilities &= ~TENSTORRENT_RESET_LEASE_CAP_EXECUTION;
+        exchange(device, operations[op], -EPROTO, "rejects executing without the execution capability");
+        response.capabilities |= TENSTORRENT_RESET_LEASE_CAP_EXECUTION;
+        response.lease_reset_generation = 8;
+        exchange(device, operations[op], -EPROTO, "rejects a stale executing generation");
+        response.lease_reset_generation = 9;
+        response.state = TENSTORRENT_RESET_LEASE_HELD;
+        exchange(device, operations[op], op == 0 ? 0 : -EPROTO, "only begin-execution must return executing");
+        kernel_error = EINVAL;
+        exchange(device, operations[op], -EINVAL, "the old driver's version rejection has no fallback");
+        kernel_error = 0;
+    }
+    expected_version = TENSTORRENT_RESET_LEASE_VERSION;
+    query(device, -EPROTO, "legacy query rejects capabilities outside its version");
+}
+
 int main(void) {
     tt_device_t *device = NULL;
     expect(tt_device_open("/dev/tenstorrent/42", &device, O_APPEND) == 0, "original device opens");
@@ -287,6 +326,7 @@ int main(void) {
     }
     kernel_error = 0;
     mutations(device);
+    execution_lease(device);
     unsigned prior_calls = calls;
     tt_reset_lease_info_t output;
     memset(&output, 0x5a, sizeof(output));

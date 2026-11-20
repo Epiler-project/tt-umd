@@ -54,9 +54,18 @@ std::unique_ptr<TopologyDiscovery> TopologyDiscovery::create_topology_discovery(
     tt::ARCH current_arch = ARCH::Invalid;
     std::map<int, PciDeviceInfo> selected_pci_devices;
 
+    if (options.exclusive_execution_bdf &&
+        (io_device_type != IODeviceType::PCIe || options.discover_remote_devices)) {
+        throw std::invalid_argument("Exclusive execution requires local PCIe discovery");
+    }
     switch (io_device_type) {
         case IODeviceType::PCIe: {
             selected_pci_devices = PCIDevice::enumerate_devices_info();
+            if (options.exclusive_execution_bdf &&
+                (selected_pci_devices.size() != 1 ||
+                 selected_pci_devices.begin()->second.pci_bdf != *options.exclusive_execution_bdf)) {
+                throw std::invalid_argument("Exclusive execution requires exactly the selected visible PCI function");
+            }
             if (selected_pci_devices.empty()) {
                 return nullptr;
             }
@@ -112,7 +121,8 @@ std::unique_ptr<TopologyDiscovery> TopologyDiscovery::create_topology_discovery(
         // identity. Acquire ordinary power mode only after visibility filtering
         // and re-query this actual handle before any BAR or DMA side effect.
         discovery->pci_devices_.push_back(
-            std::make_unique<PCIDevice>(PciDeviceConnection(device_id), selected_info));
+            std::make_unique<PCIDevice>(PciDeviceConnection(device_id, options.exclusive_execution_bdf
+                ? PciDeviceConnectionMode::ExclusiveExecution : PciDeviceConnectionMode::Ordinary), selected_info));
     }
     std::stable_sort(
         discovery->pci_devices_.begin(), discovery->pci_devices_.end(), [](const auto& lhs, const auto& rhs) {

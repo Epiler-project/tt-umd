@@ -74,7 +74,8 @@ public:
         std::vector<uint32_t>& return_values,
         const std::vector<uint32_t>& args = {},
         const std::chrono::milliseconds timeout_ms = timeout::ARC_MESSAGE_TIMEOUT,
-        const NocId noc_id = NocId::DEFAULT_NOC);
+        const NocId noc_id = NocId::DEFAULT_NOC,
+        uint8_t* handler_status = nullptr);
 
     static std::unique_ptr<BlackholeArcMessageQueue> get_blackhole_arc_message_queue(
         DeviceProtocol* device_protocol,

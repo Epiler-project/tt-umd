@@ -30,7 +30,7 @@ struct tt_device_t;
 
 namespace tt::umd {
 
-enum class PciDeviceConnectionMode { Ordinary, LockOnly };
+enum class PciDeviceConnectionMode { Ordinary, LockOnly, ExclusiveExecution };
 enum class PciDeviceConnectionStatus { Ready, LockAcquireFailed, LockReleaseFailed };
 
 struct PciDeviceConnectionFailure {
@@ -160,6 +160,8 @@ public:
     int get_device_num() const { return pci_device_num; }
     tt_device_t *get_handle() const;
     bool is_valid() const noexcept;
+    bool has_exclusive_execution() const;
+    uint64_t execution_lease_id() const;
 
 private:
     friend class PCIDevice;
