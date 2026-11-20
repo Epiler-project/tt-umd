@@ -851,7 +851,7 @@ TEST_P(PcieDmaConnectionTest, FirmwareArcCommandUsesSelectedConnectionAndHonorsS
     auto *const pci = chip->get_tt_device()->get_pci_device();
     auto *const firmware = chip->get_tt_device()->get_device_firmware();
     io.rejectArcLockAcquire = true;
-    EXPECT_THROW((void)firmware->send_device_command(0x90, {}, std::chrono::milliseconds(10)), RuntimeException);
+    EXPECT_THROW((void)firmware->send_device_command(0x90, {}, std::chrono::milliseconds(10)), ConnectionException);
     ASSERT_FALSE(io.locks.empty());
     EXPECT_EQ(io.locks.back().index, ArcLockIndex);
     EXPECT_EQ(io.locks.back().fd, ordinaryFd);
