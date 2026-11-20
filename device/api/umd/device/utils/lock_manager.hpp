@@ -21,7 +21,7 @@ namespace tt::umd {
 
 class PciDeviceConnection;
 struct PciDeviceConnectionState;
-enum class PcieResourceLockKind { Dma, MemoryBarrier, ChipInUse };
+enum class PcieResourceLockKind { Dma, MemoryBarrier, ChipInUse, ArcMessage };
 
 // A guard retains only the original opaque driver connection, never PCIDevice
 // or its mappings. The registry owns the stable shared-memory mutex alone.

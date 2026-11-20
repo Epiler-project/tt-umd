@@ -25,7 +25,7 @@ class DeviceProtocol;
 class FirmwareInfoProvider;
 class FirmwareTelemetryReader;
 class JtagInterface;
-class PcieInterface;
+class PcieProtocol;
 
 /**
  * @brief Blackhole implementation of DeviceFirmware.
@@ -39,7 +39,7 @@ class BlackholeDeviceFirmware : public DeviceFirmware {
 public:
     BlackholeDeviceFirmware(
         DeviceProtocol* device_protocol,
-        PcieInterface* pcie_interface,
+        PcieProtocol* pcie_interface,
         JtagInterface* jtag_interface,
         ArchitectureImplementation* architecture_impl);
 
@@ -133,7 +133,7 @@ private:
 
     // All non-owning; they belong to the object that owns this one and must outlive it.
     DeviceProtocol* device_protocol_ = nullptr;
-    PcieInterface* pcie_interface_ = nullptr;
+    PcieProtocol* pcie_interface_ = nullptr;
     JtagInterface* jtag_interface_ = nullptr;
     ArchitectureImplementation* architecture_impl_ = nullptr;
 

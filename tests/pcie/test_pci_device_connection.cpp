@@ -46,6 +46,7 @@
 
 // ioctl.h owns legacy macro names which overlap public UMD enums.
 #include "ioctl.h"
+#include <sys/sysmacros.h>
 
 namespace {
 
@@ -108,6 +109,8 @@ struct IoState {
     bool discoveryActive = false;
     bool changeSelectedIdentity = false;
     bool reverseBdfOrder = false;
+    bool malformedIdentity = false;
+    bool missingPciSysfs = false;
     unsigned discoveryDirectoryOpens = 0;
     std::string discoveryDirectory;
     int closeError = 0;
@@ -233,6 +236,15 @@ std::optional<std::string_view> fakeSysfsContents(const char *path) {
     if (path == nullptr)
         return std::nullopt;
     const std::string_view value(path);
+    if (io.discoveryActive &&
+        (value == "/sys/dev/char/240:42/device/uevent" || value == "/sys/dev/char/240:43/device/uevent")) {
+        if (io.malformedIdentity)
+            return "DRIVER=tenstorrent\nPCI_ID=1E52:B140\nPCI_SUBSYS_ID=1E52:0000\nPCI_SLOT_NAME=0000:01:02.8\n";
+        const bool first = (value == "/sys/dev/char/240:42/device/uevent") != io.reverseBdfOrder;
+        return first
+                   ? "DRIVER=tenstorrent\nPCI_ID=1E52:B140\nPCI_SUBSYS_ID=1E52:0000\nPCI_SLOT_NAME=0000:01:02.0\n"
+                   : "DRIVER=tenstorrent\nPCI_ID=1E52:B140\nPCI_SUBSYS_ID=1E52:0000\nPCI_SLOT_NAME=0000:02:02.0\n";
+    }
     if (value == "/sys/module/tenstorrent/version")
         return "2.10.0\n";
     const auto prefix = io.discoveryActive && value.substr(0, SecondDeviceSysfsPath.size()) == SecondDeviceSysfsPath
@@ -269,6 +281,11 @@ int sysfsFile(std::string_view content) {
 }
 
 std::optional<int> interceptedOpen(const char *path, int flags = 0) {
+    if (fixtureActive && io.missingPciSysfs && path != nullptr &&
+        std::string_view(path) == "/sys/dev/char/240:42/device/uevent") {
+        errno = ENOENT;
+        return -1;
+    }
     // libstdc++ directory_iterator uses open/openat followed by fdopendir.
     if (fixtureActive && io.discoveryActive && path != nullptr &&
         (std::string_view(path) == "/dev/tenstorrent" || std::string_view(path) == "/dev/tenstorrent/")) {
@@ -479,10 +496,34 @@ TEST_F(PciDeviceDiscoveryTest, AcquisitionRetainsOnlyTheSelectedDeviceAfterMetad
         EXPECT_TRUE(io.isClosed(fd));
 }
 
-TEST_F(PciDeviceDiscoveryTest, FixtureMetadataReaderUsesTheRealDriverQuery) {
+TEST_F(PciDeviceDiscoveryTest, EnumeratesSysfsIdentityWithoutDeviceOpens) {
+    const auto devices = tt::umd::PCIDevice::enumerate_devices_info();
+    ASSERT_EQ(devices.size(), 2u);
+    EXPECT_EQ(devices.at(43).pci_bdf, "0000:02:02.0");
     const auto info = tt::umd::PCIDevice::read_device_info(std::string(DevicePath));
     EXPECT_EQ(info.pci_bdf, "0000:01:02.0");
+    EXPECT_EQ(info.vendor_id, 0x1e52);
+    EXPECT_EQ(info.device_id, TT_BLACKHOLE_PCI_DEVICE_ID);
+    EXPECT_EQ(info.subsystem_vendor_id, 0x1e52);
+    EXPECT_EQ(info.subsystem_id, 0);
+    EXPECT_EQ(io.deviceOpens, 0u);
+    EXPECT_EQ(io.deviceInfoQueries, 0u);
+}
+
+TEST_F(PciDeviceDiscoveryTest, RejectsMalformedSysfsIdentityBeforeDeviceOpen) {
+    io.malformedIdentity = true;
+    EXPECT_THROW((void)tt::umd::PCIDevice::read_device_info(std::string(DevicePath)), std::exception);
+    EXPECT_TRUE(tt::umd::PCIDevice::enumerate_devices_info().empty());
+    EXPECT_EQ(io.deviceOpens, 0u);
+}
+
+TEST_F(PciDeviceDiscoveryTest, UsesDriverIdentityWhenPciSysfsIsUnavailable) {
+    io.missingPciSysfs = true;
+    const auto info = tt::umd::PCIDevice::read_device_info(std::string(DevicePath));
+    EXPECT_EQ(info.pci_bdf, "0000:01:02.0");
+    EXPECT_EQ(io.deviceOpens, 1u);
     EXPECT_EQ(io.deviceInfoQueries, 1u);
+    EXPECT_TRUE(ordinaryConnections().empty());
 }
 
 TEST_F(PciDeviceDiscoveryTest, AcquisitionRejectsChangedSelectedIdentityBeforeMapping) {
@@ -834,6 +875,12 @@ TEST_F(PciDeviceConnectionTest, BarMappingPreservesMmapErrnoAndClearsOutput) {
 // reach calls from the linked tt-umd DSO; linker --wrap only rewrites objects
 // linked directly into this executable.
 extern "C" __attribute__((visibility("default"))) int stat(const char *path, struct stat *buffer) noexcept {
+    if (fixtureActive && io.discoveryActive && isDevicePath(path)) {
+        *buffer = {};
+        buffer->st_mode = S_IFCHR | 0660;
+        buffer->st_rdev = makedev(240, std::string_view(path) == DevicePath ? 42 : 43);
+        return 0;
+    }
     if (fixtureActive && io.discoveryActive &&
         (std::string_view(path) == "/dev/tenstorrent" || std::string_view(path) == "/dev/tenstorrent/"))
         path = io.discoveryDirectory.c_str();

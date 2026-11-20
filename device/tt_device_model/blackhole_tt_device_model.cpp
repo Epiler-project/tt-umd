@@ -41,7 +41,8 @@ BlackholeTTDeviceModel::BlackholeTTDeviceModel(
     architecture_impl_(std::make_unique<BlackholeImplementation>()),
     pci_device_(pci_device.get()) {
     auto pcie_protocol = std::make_unique<PcieProtocol>(std::move(pci_device), use_safe_api);
-    pcie_interface_ = pcie_protocol.get();
+    auto *const pcie = pcie_protocol.get();
+    pcie_interface_ = pcie;
     dma_interface_ = pcie_protocol.get();
     protocol_ = std::move(pcie_protocol);
     hang_detector_ = std::make_unique<BlackholeHangDetector>(
@@ -51,7 +52,7 @@ BlackholeTTDeviceModel::BlackholeTTDeviceModel(
     }
 
     device_firmware_ = std::make_unique<BlackholeDeviceFirmware>(
-        protocol_.get(), pcie_interface_, jtag_interface_, architecture_impl_.get());
+        protocol_.get(), pcie, nullptr, architecture_impl_.get());
 }
 
 BlackholeTTDeviceModel::BlackholeTTDeviceModel(
@@ -67,7 +68,7 @@ BlackholeTTDeviceModel::BlackholeTTDeviceModel(
         protocol_.get(), read_noc_translation_enabled(/*pcie_interface=*/nullptr, jtag_interface_));
 
     device_firmware_ = std::make_unique<BlackholeDeviceFirmware>(
-        protocol_.get(), pcie_interface_, jtag_interface_, architecture_impl_.get());
+        protocol_.get(), nullptr, jtag_interface_, architecture_impl_.get());
 }
 
 // Out-of-line: the unique_ptr members hold forward-declared types, whose deleters need a

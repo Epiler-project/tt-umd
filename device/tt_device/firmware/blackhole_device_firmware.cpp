@@ -10,6 +10,7 @@
 #include <thread>
 #include <tt-logger/tt-logger.hpp>
 #include <utility>
+#include <variant>
 
 #include "umd/device/arc/arc_telemetry_reader.hpp"
 #include "umd/device/arc/firmware_telemetry_reader.hpp"
@@ -19,7 +20,8 @@
 #include "umd/device/firmware/firmware_info_provider_implementation.hpp"
 #include "umd/device/tt_device/protocol/device_protocol.hpp"
 #include "umd/device/tt_device/protocol/jtag_interface.hpp"
-#include "umd/device/tt_device/protocol/pcie_interface.hpp"
+#include "umd/device/tt_device/protocol/pcie_protocol.hpp"
+#include "umd/device/pcie/pci_device.hpp"
 #include "umd/device/tt_device/tt_device_error.hpp"
 #include "umd/device/types/blackhole_arc.hpp"
 #include "umd/device/types/blackhole_eth.hpp"
@@ -40,7 +42,7 @@ namespace tt::umd {
 
 BlackholeDeviceFirmware::BlackholeDeviceFirmware(
     DeviceProtocol* device_protocol,
-    PcieInterface* pcie_interface,
+    PcieProtocol* pcie_interface,
     JtagInterface* jtag_interface,
     ArchitectureImplementation* architecture_impl) :
     device_protocol_(device_protocol),
@@ -60,11 +62,9 @@ BlackholeDeviceFirmware::BlackholeDeviceFirmware(
     // protocol faulted there before the assert could report it.
     device_id_ = device_protocol_->get_mmio_id();
 
-    // acquire_mutex() throws unless the mutex was initialized first, so claim it up front. For a
-    // PCIe device this is the same key BlackholeArcMessenger uses (its device-number argument
-    // defaults the type to PCIe), so this path and the messenger - still alive for tests - exclude
-    // each other; the messenger never worked over JTAG, where this adds the missing key.
-    LockManager::initialize_mutex(MutexType::ARC_MSG, device_id_, get_io_device_type());
+    if (jtag_interface_) {
+        LockManager::initialize_mutex(MutexType::ARC_MSG, device_id_, IODeviceType::JTAG);
+    }
 
     // Resolve both ARC coordinates once. The NOC translation state they depend on is fixed for the
     // device's lifetime and is read over BAR/JTAG, so this does not need the firmware to be up.
@@ -130,10 +130,15 @@ DeviceCommandResult BlackholeDeviceFirmware::send_device_command(
     }
 
     // Serializes against other processes messaging the same device's ARC.
-    auto lock = LockManager::acquire_mutex(MutexType::ARC_MSG, device_id_, get_io_device_type());
+    using ArcLock = std::variant<PcieResourceLock, std::unique_lock<MutexInterface>>;
+    auto lock = pcie_interface_
+                    ? ArcLock{LockManager::acquire_pcie_resource(
+                          pcie_interface_->get_pci_device()->get_connection(), PcieResourceLockKind::ArcMessage)}
+                    : ArcLock{LockManager::acquire_mutex(MutexType::ARC_MSG, device_id_, IODeviceType::JTAG)};
 
     std::vector<uint32_t> return_values;
     uint32_t exit_code = arc_msg_queue_->send_message((ArcMessageType)msg_code, return_values, args, timeout, noc_id);
+    std::visit([](auto& guard) { guard.unlock(); }, lock);
 
     log_debug(
         LogUMD,

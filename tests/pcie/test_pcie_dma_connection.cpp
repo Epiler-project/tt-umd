@@ -327,11 +327,13 @@ protected:
         ASSERT_EQ(io.tlbAllocations, 1u);
         ASSERT_EQ(io.dmaAllocations, 1u);
         ASSERT_TRUE(io.locks.empty());
+        ASSERT_EQ(io.opens.size(), 1u) << "Blackhole firmware must reuse the selected PCI connection";
 
-        // ARC_MSG remains a separate lock-only connection in this bounded
-        // cut. Observe its real index16 acquire/release before testing index21;
-        // never mistake ARC's allowed O_APPEND open for a DMA reopen.
+        // Exercise the numeric lock-only client independently. It must contend
+        // with firmware on index 16 while keeping its own OFD and lifetime.
         {
+            tt::umd::LockManager::initialize_mutex(
+                tt::umd::MutexType::ARC_MSG, io.deviceNumber, tt::umd::IODeviceType::PCIe);
             auto arc = tt::umd::LockManager::acquire_mutex(
                 tt::umd::MutexType::ARC_MSG, io.deviceNumber, tt::umd::IODeviceType::PCIe);
         }
@@ -840,6 +842,43 @@ TEST_P(PcieDmaConnectionTest, NumericPcieChipInUseHasNoCompatibilityFallback) {
         RuntimeException);
     EXPECT_EQ(io.opens.size(), opens);
     EXPECT_TRUE(io.locks.empty());
+}
+
+TEST_P(PcieDmaConnectionTest, FirmwareArcCommandUsesSelectedConnectionAndHonorsStaleGeneration) {
+    auto chip = createReadyLocalChip();
+    ASSERT_NE(chip, nullptr);
+    const auto opens = io.opens.size();
+    auto *const pci = chip->get_tt_device()->get_pci_device();
+    auto *const firmware = chip->get_tt_device()->get_device_firmware();
+    io.rejectArcLockAcquire = true;
+    EXPECT_THROW((void)firmware->send_device_command(0x90, {}, std::chrono::milliseconds(10)), RuntimeException);
+    ASSERT_FALSE(io.locks.empty());
+    EXPECT_EQ(io.locks.back().index, ArcLockIndex);
+    EXPECT_EQ(io.locks.back().fd, ordinaryFd);
+    EXPECT_EQ(io.arcAcquireErrors, 1u);
+    EXPECT_FALSE(pci->get_connection().is_valid());
+    EXPECT_FALSE(io.isClosed(ordinaryFd));
+    EXPECT_EQ(io.opens.size(), opens);
+}
+
+TEST_P(PcieDmaConnectionTest, RetainedAndNumericArcGuardsExcludeEachOtherOnTheSameResource) {
+    auto &connection = device->get_pci_device()->get_connection();
+    const auto opens = io.opens.size();
+    {
+        auto retained = tt::umd::LockManager::acquire_pcie_resource(connection, tt::umd::PcieResourceLockKind::ArcMessage);
+        EXPECT_EQ(io.heldLocks.at(ArcLockIndex), ordinaryFd);
+        EXPECT_TRUE(tt::umd::LockManager::probe_mutex(
+            tt::umd::MutexType::ARC_MSG, io.deviceNumber, tt::umd::IODeviceType::PCIe).has_value());
+    }
+    {
+        auto numeric = tt::umd::LockManager::acquire_mutex(
+            tt::umd::MutexType::ARC_MSG, io.deviceNumber, tt::umd::IODeviceType::PCIe);
+        EXPECT_EQ(io.heldLocks.at(ArcLockIndex), arcFd);
+        EXPECT_TRUE(tt::umd::LockManager::probe_pcie_resource(
+            connection, tt::umd::PcieResourceLockKind::ArcMessage).has_value());
+    }
+    EXPECT_TRUE(io.heldLocks.empty());
+    EXPECT_EQ(io.opens.size(), opens);
 }
 
 TEST_P(PcieDmaConnectionTest, ArcMessageLockAcquireDoesNotReopenAfterDeviceGenerationFailure) {

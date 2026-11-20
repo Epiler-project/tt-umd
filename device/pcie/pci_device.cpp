@@ -11,6 +11,7 @@
 #include <unistd.h>       // for ::close
 
 #include <array>
+#include <charconv>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -43,6 +44,8 @@
 #include "umd/device/utils/semver.hpp"
 #include "umd/device/utils/timeouts.hpp"
 #include "utils.hpp"
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 namespace tt::umd {
 
@@ -228,14 +231,57 @@ PciDeviceConnection PciDeviceConnection::require_ordinary() && {
 }
 
 PciDeviceInfo PCIDevice::read_device_info(const std::string &device_path) {
-    tt_device_t *dev_handle = nullptr;
-    int err = tt_device_open(device_path.c_str(), &dev_handle, O_APPEND);
-    if (err != 0) {
-        UMD_THROW(error::RuntimeError, fmt::format("Failed to open device {}: {}", device_path, strerror(-err)));
+    struct stat node {};
+    if (::stat(device_path.c_str(), &node) || !S_ISCHR(node.st_mode)) {
+        UMD_THROW(error::RuntimeError, fmt::format("Missing PCI character device: {}", device_path));
+    }
+    // Bind discovery to the character device visible in this namespace. The
+    // kernel emits all PCI identifiers in a single uevent on its parent.
+    const auto path = fmt::format("/sys/dev/char/{}:{}/device/uevent", major(node.st_rdev), minor(node.st_rdev));
+    std::ifstream uevent(path);
+    if (!uevent.is_open()) {
+        // A container can expose the device without mounting its PCI sysfs.
+        tt_device_t *handle = nullptr;
+        const int error_number = tt_device_open(device_path.c_str(), &handle, O_APPEND);
+        if (error_number != 0) {
+            UMD_THROW(error::RuntimeError, fmt::format("Failed to open device {}: {}", device_path, strerror(-error_number)));
+        }
+        std::unique_ptr<tt_device_t, decltype(&tt_device_close)> owner(handle, &tt_device_close);
+        return read_device_info(owner.get());
+    }
+    std::string ids, subsystem, slot;
+    bool bound = false;
+    for (std::string line; std::getline(uevent, line);) {
+        if (line == "DRIVER=tenstorrent") {
+            bound = true;
+        } else if (line.compare(0, 7, "PCI_ID=") == 0) {
+            ids = line.substr(7);
+        } else if (line.compare(0, 14, "PCI_SUBSYS_ID=") == 0) {
+            subsystem = line.substr(14);
+        } else if (line.compare(0, 14, "PCI_SLOT_NAME=") == 0) {
+            slot = line.substr(14);
+        }
     }
 
-    std::unique_ptr<tt_device_t, decltype(&tt_device_close)> owner(dev_handle, &tt_device_close);
-    return read_device_info(owner.get());
+    auto invalid = [&] { UMD_THROW(error::RuntimeError, fmt::format("Invalid PCI device identity at {}", path)); };
+    if (!uevent.eof() || uevent.bad() || !bound || ids.size() != 9 || ids[4] != ':' ||
+        subsystem.size() != 9 || subsystem[4] != ':' || slot.size() != 12 ||
+        slot[4] != ':' || slot[7] != ':' || slot[10] != '.') {
+        invalid();
+    }
+    auto hex = [&](const std::string &s, size_t start, size_t width) {
+        uint16_t value = 0;
+        const char *end = s.data() + start + width;
+        const auto parsed = std::from_chars(s.data() + start, end, value, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) invalid();
+        return value;
+    };
+    PciDeviceInfo info{
+        hex(ids, 0, 4), hex(ids, 5, 4), hex(subsystem, 0, 4), hex(subsystem, 5, 4),
+        hex(slot, 0, 4), hex(slot, 5, 2), hex(slot, 8, 2), hex(slot, 11, 1), slot,
+        get_physical_slot_for_pcie_bdf(slot)};
+    if (info.pci_device > 31 || info.pci_function > 7) invalid();
+    return info;
 }
 
 PciDeviceInfo PCIDevice::read_device_info(tt_device_t *handle) {
@@ -320,7 +366,7 @@ std::vector<int> PCIDevice::enumerate_devices() {
 
     std::vector<int> all_device_ids = {};
 
-    for (const auto &[bdf, device_id] : get_bdf_to_device_id_map()) {
+    for (const auto &[bdf, device_id] : bdf_to_device_id_map) {
         all_device_ids.push_back(device_id);
     }
 

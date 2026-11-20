@@ -205,8 +205,20 @@ PcieResourceLockDescriptor resource_lock_descriptor(PcieResourceLockKind kind) {
         return {MutexType::MEM_BARRIER, 19};
     case PcieResourceLockKind::ChipInUse:
         return {MutexType::CHIP_IN_USE, 20};
+    case PcieResourceLockKind::ArcMessage:
+        return {MutexType::ARC_MSG, get_kmd_lock_index(MutexType::ARC_MSG)};
     }
     UMD_THROW(error::RuntimeError, "Unknown PCIe resource lock kind.");
+}
+
+MutexInterface& retained_resource_mutex(const PcieResourceLockDescriptor& descriptor, int device_num) {
+    const auto name = get_mutex_name(descriptor.mutex_type, device_num, IODeviceType::PCIe);
+    // The numeric ARC API stores a composite mutex under the original name.
+    // Keep a separate registry entry for the robust half while opening the
+    // same process-shared mutex. Both protocols take it before KMD index 16.
+    const auto key = descriptor.mutex_type == MutexType::ARC_MSG ? name + "/retained" : name;
+    add_mutex(key, std::make_unique<RobustMutex>(name));
+    return get_initialized_mutex(key);
 }
 
 }  // namespace
@@ -260,9 +272,7 @@ PcieResourceLock LockManager::acquire_pcie_resource(PciDeviceConnection &connect
     UMD_ASSERT(connection.state != nullptr, error::RuntimeError, "Cannot lock an empty PCIe connection.");
     auto state = connection.state;
     state->require_valid();
-    const auto name = get_mutex_name(descriptor.mutex_type, state->device_num, IODeviceType::PCIe);
-    initialize_robust_mutex(name);
-    PcieResourceLock guard(state, get_initialized_mutex(name), descriptor.index);
+    PcieResourceLock guard(state, retained_resource_mutex(descriptor, state->device_num), descriptor.index);
     try {
         guard.robust_->lock();
     } catch (...) {
@@ -294,9 +304,7 @@ std::optional<std::pair<pid_t, pid_t>> LockManager::probe_pcie_resource(
     UMD_ASSERT(connection.state != nullptr, error::RuntimeError, "Cannot probe an empty PCIe connection.");
     auto state = connection.state;
     state->require_valid();
-    const auto name = get_mutex_name(descriptor.mutex_type, state->device_num, IODeviceType::PCIe);
-    initialize_robust_mutex(name);
-    auto &robust = get_initialized_mutex(name);
+    auto &robust = retained_resource_mutex(descriptor, state->device_num);
     if (const auto owner = robust.probe_lock(std::chrono::seconds(0)))
         return owner;
     PcieResourceLock guard(state, robust, descriptor.index);
