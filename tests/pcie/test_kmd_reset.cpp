@@ -22,20 +22,18 @@
 
 namespace {
 
-// Only the syscall/allocation boundary is substituted. tt_device_open, lease
-// query, reset and close are the real library implementation.
+// Only the syscall/allocation boundary is substituted. tt_device_open, reset
+// and close are the real library implementation.
 constexpr int device_fd = 701;
 constexpr const char* device_path = "/dev/tenstorrent/42";
 
 struct IoState {
     unsigned opens = 0;
     unsigned ioctls = 0;
-    unsigned lease_queries = 0;
     unsigned closes = 0;
     unsigned frees = 0;
     int open_error = 0;
     int ioctl_error = 0;
-    int lease_ioctl_error = 0;
     int close_error = 0;
     int free_errno = 0;
     bool capture_allocation = false;
@@ -47,11 +45,6 @@ struct IoState {
     uint32_t input_flags = 0;
     uint32_t output_size = sizeof(tenstorrent_reset_device_out);
     uint32_t output_result = 0;
-    uint32_t lease_capabilities = TENSTORRENT_RESET_LEASE_CAP_EXCLUSIVE;
-    uint32_t lease_state = TENSTORRENT_RESET_LEASE_NONE;
-    uint64_t lease_id = 0;
-    uint64_t lease_reset_generation = 0;
-    uint64_t device_reset_generation = 7;
 };
 
 IoState io;
@@ -122,25 +115,6 @@ extern "C" int __wrap_ioctl(int fd, unsigned long request, ...) {
     }
     va_list args;
     va_start(args, request);
-    if (request == TENSTORRENT_IOCTL_RESET_LEASE) {
-        ++io.lease_queries;
-        auto* lease = va_arg(args, tenstorrent_reset_lease*);
-        va_end(args);
-        EXPECT_EQ(lease->in.argsz, sizeof(*lease));
-        EXPECT_EQ(lease->in.version, TENSTORRENT_RESET_LEASE_VERSION);
-        EXPECT_EQ(lease->in.operation, TENSTORRENT_RESET_LEASE_QUERY);
-        EXPECT_EQ(lease->in.reserved, 0u);
-        if (io.lease_ioctl_error != 0) {
-            errno = io.lease_ioctl_error;
-            return -1;
-        }
-        lease->out.capabilities = io.lease_capabilities;
-        lease->out.state = io.lease_state;
-        lease->out.lease_id = io.lease_id;
-        lease->out.lease_reset_generation = io.lease_reset_generation;
-        lease->out.device_reset_generation = io.device_reset_generation;
-        return 0;
-    }
     if (request != TENSTORRENT_IOCTL_RESET_DEVICE) {
         va_end(args);
         errno = ENOTTY;
@@ -167,9 +141,6 @@ protected:
     void SetUp() override { io = {}; }
 
     void TearDown() override {
-        // RED against the old consuming reset must not turn an assertion into
-        // a second close/use-after-free. Clean a leaked old close wrapper only
-        // after the test has observed it, without retrying Linux close.
         if (io.allocation != nullptr && !io.freed) {
             if (io.closes == 0 && io.opens != 0) {
                 tt_device_close(static_cast<tt_device_t*>(io.allocation));
@@ -226,7 +197,6 @@ TEST_F(KmdResetTest, LegacyResetApiRefusesWithoutSideEffectOrConsumingHandle) {
     tt_device_t* device = open_device();
     EXPECT_EQ(tt_device_reset(device, 6), -EOPNOTSUPP);
     EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.lease_queries, 0u);
     expect_retained();
     EXPECT_FALSE(io.freed);
     EXPECT_EQ(tt_device_close(device), 0);
@@ -237,7 +207,6 @@ TEST_F(KmdResetTest, LegacyResetApiRefusesWithoutSideEffectOrConsumingHandle) {
 TEST_F(KmdResetTest, LegacyResetApiRejectsNullHandleWithoutIoctl) {
     EXPECT_EQ(tt_device_reset(nullptr, 6), -ENODEV);
     EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.lease_queries, 0u);
 }
 
 TEST_F(KmdResetTest, ExplicitCloseConsumesHandle) {
@@ -281,117 +250,27 @@ TEST_F(KmdResetTest, AllocationFailureHasNoOpenOrClose) {
     EXPECT_EQ(io.closes, 0u);
 }
 
-TEST_F(KmdResetTest, SenderRejectsResetWithoutStrictLeaseAndNeverUsesLegacyIoctl) {
+TEST_F(KmdResetTest, SenderRefusesUnverifiableResetWithoutCallingLegacyIoctl) {
     io.capture_allocation = true;
     const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::StrictResetUnsupported);
-    EXPECT_NE(std::string(refusal.message()).find("strict reset lease"), std::string::npos);
+    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::ResetOutcomeUnverifiable);
+    EXPECT_NE(std::string(refusal.message()).find("no verifiable reset-ioctl completion contract"), std::string::npos);
     EXPECT_EQ(io.opens, 1u);
-    EXPECT_EQ(io.lease_queries, 1u);
     EXPECT_EQ(io.ioctls, 0u);
     EXPECT_EQ(io.open_flags, O_RDWR | O_CLOEXEC | O_APPEND);
     EXPECT_EQ(io.closes, 1u);
     EXPECT_EQ(io.frees, 1u);
 }
 
-TEST_F(KmdResetTest, SenderRejectsInvalidatedLeaseGenerationWithoutReset) {
-    io.lease_state = TENSTORRENT_RESET_LEASE_INVALIDATED;
-    io.lease_id = 9;
-    io.lease_reset_generation = 4;
-    io.device_reset_generation = 8;
-    io.capture_allocation = true;
-    const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::LeaseInvalidated);
-    EXPECT_NE(std::string(refusal.message()).find("invalidated reset lease"), std::string::npos);
-    EXPECT_EQ(io.lease_queries, 1u);
-    EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.opens, 1u);
-    EXPECT_EQ(io.closes, 1u);
-    EXPECT_EQ(io.frees, 1u);
-}
-
-TEST_F(KmdResetTest, SenderRejectsStrictCapabilityWithoutHeldLease) {
-    io.lease_capabilities |= TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET;
-    const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::LeaseNotHeld);
-    EXPECT_NE(std::string(refusal.message()).find("does not hold a reset lease"), std::string::npos);
-    EXPECT_EQ(io.lease_queries, 1u);
-    EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.closes, 1u);
-    EXPECT_EQ(io.frees, 1u);
-}
-
-TEST_F(KmdResetTest, SenderRejectsUnverifiableStrictResetCompletionWithoutReset) {
-    io.lease_capabilities |= TENSTORRENT_RESET_LEASE_CAP_STRICT_RESET;
-    io.lease_state = TENSTORRENT_RESET_LEASE_HELD;
-    io.lease_id = 9;
-    io.lease_reset_generation = io.device_reset_generation;
-    const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::ResetOutcomeUnverifiable);
-    EXPECT_NE(std::string(refusal.message()).find("no verifiable lease-reset completion contract"), std::string::npos);
-    EXPECT_EQ(io.lease_queries, 1u);
-    EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.closes, 1u);
-    EXPECT_EQ(io.frees, 1u);
-}
-
-class SenderResetFailureTest : public KmdResetTest, public ::testing::WithParamInterface<int> {
-protected:
-    void inject_reset_failure() {
-        switch (GetParam()) {
-            case EIO:
-                io.lease_ioctl_error = EIO;
-                break;
-            case EPROTO:
-                io.lease_capabilities = 0;
-                break;
-            case EBUSY:
-                io.lease_ioctl_error = EBUSY;
-                break;
-        }
-    }
-};
-
-TEST_P(SenderResetFailureTest, LeaseQueryFailureClosesBeforeReportingErrorWithoutReset) {
-    inject_reset_failure();
-    const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::LeaseQueryFailed);
-    EXPECT_EQ(refusal.system_error(), GetParam());
-    EXPECT_NE(std::string(refusal.message()).find(std::strerror(GetParam())), std::string::npos);
-    EXPECT_EQ(io.opens, 1u);
-    EXPECT_EQ(io.lease_queries, 1u);
-    EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.closes, 1u);
-    EXPECT_EQ(io.frees, 1u);
-}
-
-TEST_P(SenderResetFailureTest, LeaseQueryErrorTakesPriorityOverCloseError) {
-    inject_reset_failure();
-    io.close_error = ENOSPC;
-    const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::LeaseQueryFailed);
-    EXPECT_EQ(refusal.system_error(), GetParam());
-    EXPECT_EQ(refusal.close_error(), ENOSPC);
-    EXPECT_NE(std::string(refusal.message()).find(std::strerror(GetParam())), std::string::npos);
-    EXPECT_NE(std::string(refusal.message()).find(std::strerror(ENOSPC)), std::string::npos);
-    EXPECT_EQ(io.lease_queries, 1u);
-    EXPECT_EQ(io.ioctls, 0u);
-    EXPECT_EQ(io.closes, 1u);
-    EXPECT_EQ(io.frees, 1u);
-}
-
-INSTANTIATE_TEST_SUITE_P(ResetFailure, SenderResetFailureTest, ::testing::Values(EIO, EPROTO, EBUSY));
-
 class SenderCloseFailureTest : public KmdResetTest, public ::testing::WithParamInterface<int> {};
 
-TEST_P(SenderCloseFailureTest, StrictLeaseRefusalReportsCloseErrorWithoutRetry) {
+TEST_P(SenderCloseFailureTest, ResetRefusalReportsCloseErrorWithoutRetry) {
     io.close_error = GetParam();
     const auto refusal = sender_refusal();
-    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::StrictResetUnsupported);
+    EXPECT_EQ(refusal.reason(), tt::umd::detail::ResetRefusalReason::ResetOutcomeUnverifiable);
     EXPECT_EQ(refusal.close_error(), GetParam());
-    EXPECT_NE(std::string(refusal.message()).find("strict reset lease"), std::string::npos);
+    EXPECT_NE(std::string(refusal.message()).find("no verifiable reset-ioctl completion contract"), std::string::npos);
     EXPECT_NE(std::string(refusal.message()).find(std::strerror(GetParam())), std::string::npos);
-    EXPECT_EQ(io.lease_queries, 1u);
     EXPECT_EQ(io.ioctls, 0u);
     EXPECT_EQ(io.closes, 1u);
     EXPECT_EQ(io.frees, 1u);

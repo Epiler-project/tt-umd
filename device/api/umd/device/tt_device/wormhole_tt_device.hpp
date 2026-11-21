@@ -24,6 +24,11 @@ enum class IODeviceType;
 
 class WormholeTTDevice : public TTDevice {
 public:
+    ~WormholeTTDevice() override;
+
+    uint64_t reset_tensix_tiles(CoreCoord physical_worker) override;
+    bool has_tensix_reset(CoreCoord physical_worker, uint64_t epoch) const override;
+
     void configure_iatu_region(size_t region, uint64_t target, size_t region_size) override;
 
     uint32_t get_clock() override;
@@ -34,13 +39,14 @@ public:
 
     void write_to_arc_apb(const void *mem_ptr, uint64_t arc_addr_offset, size_t size) override;
 
-    ~WormholeTTDevice() override = default;
-
 protected:
     explicit WormholeTTDevice(std::unique_ptr<TTDeviceModel> model);
 
 private:
     const ArchitectureRegisters registers_ = get_architecture_registers(tt::ARCH::WORMHOLE_B0);
+
+    struct ResetController;
+    std::unique_ptr<ResetController> reset_controller_;
 
     // Builds the ARC message (with the common prefix) that requests the given clock state.
 

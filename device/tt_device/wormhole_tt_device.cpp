@@ -6,6 +6,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -17,6 +18,7 @@
 
 #include "noc_access.hpp"
 #include "tracy.hpp"
+#include "tt_device/wormhole_tensix_reset.hpp"
 #include "umd/device/arch/architecture_implementation.hpp"
 #include "umd/device/arch/wormhole_implementation.hpp"
 #include "umd/device/coordinates/coordinate_manager.hpp"
@@ -40,7 +42,48 @@
 
 namespace tt::umd {
 
-WormholeTTDevice::WormholeTTDevice(std::unique_ptr<TTDeviceModel> model) : TTDevice(std::move(model)) {}
+struct WormholeTTDevice::ResetController {
+    explicit ResetController(WormholeTTDevice& device) : device(device), reset(*this) {}
+
+    bool has_exclusive_execution() const {
+        auto* pci = device.get_pci_device();
+        return pci != nullptr && pci->get_connection().has_exclusive_execution();
+    }
+
+    void check_worker(CoreCoord worker) const {
+        const auto workers = device.get_soc_descriptor().get_cores(CoreType::TENSIX, CoordSystem::NOC0);
+        UMD_ASSERT(
+            std::find(workers.begin(), workers.end(), worker) != workers.end(),
+            error::RuntimeError,
+            "Tensix reset requires an active physical NOC0 Tensix worker.");
+    }
+
+    void power_up() { device.set_power_state(PowerState::BUSY, NocId::NOC0); }
+
+    uint32_t read_soft_reset(CoreCoord worker) const {
+        uint32_t value = 0;
+        device.read_from_device_reg(&value, worker, wormhole::TENSIX_SOFT_RESET_ADDR, sizeof(value), NocId::NOC0);
+        return value;
+    }
+
+    void write_soft_reset(CoreCoord worker, uint32_t value) {
+        device.write_to_device_reg(&value, worker, wormhole::TENSIX_SOFT_RESET_ADDR, sizeof(value), NocId::NOC0);
+    }
+
+    WormholeTTDevice& device;
+    wormhole::TensixReset<ResetController> reset;
+};
+
+WormholeTTDevice::WormholeTTDevice(std::unique_ptr<TTDeviceModel> model) :
+    TTDevice(std::move(model)), reset_controller_(std::make_unique<ResetController>(*this)) {}
+
+WormholeTTDevice::~WormholeTTDevice() = default;
+
+uint64_t WormholeTTDevice::reset_tensix_tiles(CoreCoord worker) { return reset_controller_->reset.run(worker); }
+
+bool WormholeTTDevice::has_tensix_reset(CoreCoord worker, uint64_t epoch) const {
+    return reset_controller_->reset.matches(worker, epoch);
+}
 
 uint32_t WormholeTTDevice::get_clock() {
     // There is one return value from AICLK ARC message.

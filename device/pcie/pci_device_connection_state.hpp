@@ -39,8 +39,6 @@ struct PciDeviceConnectionState {
     const int device_num;
     const PciDeviceConnectionMode mode;
     tt_device_t *const handle;
-    uint64_t execution_lease_id = 0;
-    uint64_t execution_generation = 0;
     std::atomic<uint64_t> first_failure{0};
 };
 

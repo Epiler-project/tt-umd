@@ -161,7 +161,6 @@ public:
     tt_device_t *get_handle() const;
     bool is_valid() const noexcept;
     bool has_exclusive_execution() const;
-    uint64_t execution_lease_id() const;
 
 private:
     friend class PCIDevice;

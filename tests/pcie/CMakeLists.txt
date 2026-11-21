@@ -38,11 +38,3 @@ target_link_libraries(test_pcie_dma_connection PRIVATE test_common tt-kmd-lib::t
 set_target_properties(test_pcie_dma_connection PROPERTIES
     ENABLE_EXPORTS ON CXX_VISIBILITY_PRESET default
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test/umd/test_pcie_dma_connection)
-
-# Exercise the actual retained-handle lease API; only the Linux syscall edge is fake.
-add_executable(test_kmd_lease_query test_kmd_lease_query.c)
-target_compile_features(test_kmd_lease_query PRIVATE c_std_11)
-target_include_directories(test_kmd_lease_query PRIVATE ../../tt-kmd-lib/src)
-target_link_libraries(test_kmd_lease_query PRIVATE tt-kmd-lib::tt-kmd-lib)
-set_target_properties(test_kmd_lease_query PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/test/umd/test_kmd_lease_query)

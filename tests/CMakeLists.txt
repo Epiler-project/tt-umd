@@ -51,7 +51,6 @@ add_custom_target(
         unit_tests_glx
         test_pcie_device
         test_kmd_reset
-        test_kmd_lease_query
         test_pci_device_connection
         test_pcie_dma_connection
         api_tests

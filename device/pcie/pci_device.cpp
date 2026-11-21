@@ -177,6 +177,45 @@ static std::optional<int> get_physical_slot_for_pcie_bdf(const std::string &targ
     return std::nullopt;
 }
 
+static bool has_sole_process_ownership(int pci_device_number, int &error_code) {
+    const auto path = fmt::format("/proc/driver/tenstorrent/{}/pids", pci_device_number);
+    std::ifstream pids_file(path);
+    if (!pids_file.is_open()) {
+        error_code = errno != 0 ? errno : ENOENT;
+        return false;
+    }
+    const auto self = static_cast<long long>(::getpid());
+    bool saw_self = false;
+    for (std::string line; std::getline(pids_file, line);) {
+        if (line.empty()) {
+            continue;
+        }
+        long long pid = -1;
+        const char *begin = line.data();
+        const char *end = begin + line.size();
+        const auto parsed = std::from_chars(begin, end, pid, 10);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || pid <= 0) {
+            error_code = EPROTO;
+            return false;
+        }
+        if (pid != self) {
+            error_code = EBUSY;
+            return false;
+        }
+        saw_self = true;
+    }
+    if (!pids_file.eof() || pids_file.bad()) {
+        error_code = EIO;
+        return false;
+    }
+    if (!saw_self) {
+        error_code = ESTALE;
+        return false;
+    }
+    error_code = 0;
+    return true;
+}
+
 PciDeviceConnection::PciDeviceConnection(int pci_device_number, PciDeviceConnectionMode mode) :
     pci_device_num(pci_device_number) {
     const auto path = fmt::format("/dev/tenstorrent/{}", pci_device_number);
@@ -190,19 +229,20 @@ PciDeviceConnection::PciDeviceConnection(int pci_device_number, PciDeviceConnect
     owner.release();
     if (mode == PciDeviceConnectionMode::ExclusiveExecution) {
         int acquired = 0;
-        int err = tt_lock_acquire(handle, TT_RESET_LEASE_LOCK_INDEX, &acquired);
-        UMD_ASSERT(err == 0 && acquired, error::RuntimeError,
-                   fmt::format("Could not acquire CHIP_IN_USE for PCI device {}: {}", pci_device_number, err ? -err : EBUSY));
-        tt_reset_lease_info_t held{}, executing{};
-        err = tt_device_reset_lease_acquire(handle, &held);
-        UMD_ASSERT(!err, error::RuntimeError, fmt::format("Could not acquire PCI device {} reset lease: {}", pci_device_number, -err));
-        err = tt_device_reset_lease_begin_execution(handle, &executing);
-        UMD_ASSERT(!err, error::RuntimeError, fmt::format("Could not begin PCI device {} execution lease: {}", pci_device_number, -err));
-        UMD_ASSERT(held.lease_id == executing.lease_id &&
-                   held.lease_reset_generation == executing.lease_reset_generation, error::RuntimeError,
-                   fmt::format("PCI device {} changed lease between exclusive admission and execution.", pci_device_number));
-        state->execution_lease_id = executing.lease_id;
-        state->execution_generation = executing.lease_reset_generation;
+        const int err = tt_lock_acquire(handle, TT_CHIP_IN_USE_LOCK_INDEX, &acquired);
+        UMD_ASSERT(
+            err == 0 && acquired,
+            error::RuntimeError,
+            fmt::format("Could not acquire CHIP_IN_USE for PCI device {}: {}", pci_device_number, err ? -err : EBUSY));
+        int pid_err = 0;
+        UMD_ASSERT(
+            has_sole_process_ownership(pci_device_number, pid_err),
+            error::RuntimeError,
+            fmt::format(
+                "PCI device {} is not exclusively owned by process {}: {}",
+                pci_device_number,
+                ::getpid(),
+                strerror(pid_err)));
     }
 }
 
@@ -241,19 +281,18 @@ bool PciDeviceConnection::has_exclusive_execution() const {
     if (!state || state->mode != PciDeviceConnectionMode::ExclusiveExecution)
         return false;
     state->require_valid();
-    tt_reset_lease_info_t current{};
-    const int err = tt_device_execution_lease_query(state->handle, &current);
-    if (err || current.state != TT_RESET_LEASE_EXECUTING || current.lease_id != state->execution_lease_id ||
-        current.lease_reset_generation != state->execution_generation) {
-        state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, err ? -err : ESTALE);
+    uint32_t lock_state = 0;
+    const int err = tt_lock_test(state->handle, TT_CHIP_IN_USE_LOCK_INDEX, &lock_state);
+    if (err != 0 || (lock_state & TT_LOCK_STATE_HELD_BY_SELF) == 0) {
+        state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, err != 0 ? -err : ESTALE);
+        state->require_valid();
+    }
+    int pid_err = 0;
+    if (!has_sole_process_ownership(pci_device_num, pid_err)) {
+        state->quarantine(PciDeviceConnectionStatus::LockAcquireFailed, pid_err != 0 ? pid_err : EBUSY);
         state->require_valid();
     }
     return true;
-}
-
-uint64_t PciDeviceConnection::execution_lease_id() const {
-    UMD_ASSERT(has_exclusive_execution(), error::RuntimeError, "PCIe connection has no live execution lease.");
-    return state->execution_lease_id;
 }
 
 PciDeviceConnection PciDeviceConnection::require_ordinary() && {

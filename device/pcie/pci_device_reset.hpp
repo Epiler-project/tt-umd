@@ -12,10 +12,6 @@
 namespace tt::umd::detail {
 
 enum class ResetRefusalReason {
-    LeaseQueryFailed,
-    LeaseInvalidated,
-    StrictResetUnsupported,
-    LeaseNotHeld,
     ResetOutcomeUnverifiable,
 };
 
